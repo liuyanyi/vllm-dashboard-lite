@@ -49,22 +49,28 @@ type State struct {
 	Run         int64    `json:"run"`
 	Start       string   `json:"start"`
 	StartStatus string   `json:"start_status"`
+	FirstSeen   string   `json:"first_seen"`
+	Reason      string   `json:"reason"`
 	Model       string   `json:"model"`
 	Latest      Point    `json:"latest"`
 	Points      []Point  `json:"points"`
 	Raw         []Series `json:"raw,omitempty"`
 }
 type Worker struct {
-	mu     sync.Mutex
-	cfg    Config
-	state  State
-	prev   Snapshot
-	recent []Snapshot
-	agg    map[string]*Aggregate
-	window time.Time
-	meta   bool
-	retry  time.Time
-	cancel context.CancelFunc
+	mu           sync.Mutex
+	cfg          Config
+	state        State
+	prev         Snapshot
+	recent       []Snapshot
+	agg          map[string]*Aggregate
+	window       time.Time
+	fingerprint  string
+	metricModel  string
+	offlineSince time.Time
+	touched      time.Time
+	manual       bool
+	retry        time.Time
+	cancel       context.CancelFunc
 }
 type App struct {
 	mu      sync.Mutex
@@ -120,6 +126,7 @@ func main() {
 	mux.HandleFunc("POST /api/endpoints", a.add)
 	mux.HandleFunc("PATCH /api/endpoints/{id}", a.update)
 	mux.HandleFunc("DELETE /api/endpoints/{id}", a.remove)
+	mux.HandleFunc("POST /api/endpoints/{id}/sessions", a.newSession)
 	mux.HandleFunc("GET /api/events", a.events)
 	mux.HandleFunc("GET /api/runs", a.runs)
 	mux.HandleFunc("GET /api/history", a.history)
@@ -243,14 +250,40 @@ func (a *App) snapshot(ctx context.Context, c Config) (Snapshot, error) {
 func (a *App) collect(ctx context.Context, w *Worker) {
 	w.mu.Lock()
 	c := w.cfg
+	probe := w.state.Run == 0 || !w.offlineSince.IsZero() || w.manual || time.Now().After(w.retry)
+	previousStart, previousModel := w.state.Start, w.metricModel
 	w.mu.Unlock()
 	s, e := a.snapshot(ctx, c)
+	var model, fingerprint, metadata string
+	probe = probe || (s.Start != "" && s.Start != previousStart) || (s.Model != "" && s.Model != previousModel)
+	if e == nil && probe {
+		model, fingerprint, metadata = a.modelInfo(ctx, c, s.Model)
+		// Use a fresh metrics sample after metadata, avoiding an old-process sample
+		// being attributed to a newly reported model.
+		if metadata != "" {
+			check, err := a.snapshot(ctx, c)
+			if err != nil {
+				e = err
+			} else {
+				if check.Start != s.Start || check.Model != s.Model {
+					model, fingerprint, metadata = "", "", ""
+				}
+				s = check
+			}
+		}
+	}
 	w.mu.Lock()
 	if ctx.Err() != nil {
 		w.mu.Unlock()
 		return
 	}
 	if e != nil {
+		if w.offlineSince.IsZero() {
+			w.offlineSince = time.Now()
+			if w.state.Run > 0 && !w.prev.At.IsZero() {
+				a.db.Exec("UPDATE runs SET last_seen=? WHERE id=?", w.prev.At.UTC().Format(time.RFC3339Nano), w.state.Run)
+			}
+		}
 		w.state.Status = "offline"
 		w.state.Error = e.Error()
 		w.prev = Snapshot{}
@@ -263,36 +296,58 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 		return
 	}
 	w.state.Error = ""
-	w.state.StartStatus = s.StartStatus
 	w.state.Status = "online"
-	if s.Start != w.state.Start {
+	w.state.StartStatus = s.StartStatus
+	reason := sessionReason(w, s, fingerprint)
+	if reason != "" {
 		if !a.flush(w) {
 			w.state.Error = "历史写入失败"
 			w.mu.Unlock()
 			return
 		}
-		w.state.Start = s.Start
-		w.state.Run = 0
-		w.state.Model = s.Model
-		w.meta = false
-		w.retry = time.Time{}
-		w.prev = Snapshot{}
-		w.recent = nil
-		w.state.Points = []Point{}
-	}
-	if s.Start != "" && w.state.Run == 0 {
-		rid, m, meta, err := runIdentity(a.db, c.ID, s.Start, s.Model)
+		if w.state.Run > 0 && !w.prev.At.IsZero() {
+			a.db.Exec("UPDATE runs SET last_seen=? WHERE id=?", w.prev.At.UTC().Format(time.RFC3339Nano), w.state.Run)
+		}
+		name := model
+		if name == "" {
+			name = s.Model
+		}
+		rid, err := createSession(a.db, c.ID, s.Start, name, metadata, reason, s.At)
 		if err != nil {
-			w.state.Error = "无法保存批次"
-		} else {
-			w.state.Run = rid
-			w.state.Model = m
-			w.meta = meta != ""
+			w.state.Error = "无法保存会话"
+			w.mu.Unlock()
+			return
+		}
+		w.state.Run, w.state.Model, w.state.Start = rid, name, s.Start
+		w.state.FirstSeen, w.state.Reason = s.At.UTC().Format(time.RFC3339Nano), reason
+		w.fingerprint, w.metricModel = fingerprint, s.Model
+		w.prev, w.recent, w.state.Points = Snapshot{}, nil, []Point{}
+		w.manual = false
+		w.touched = s.At
+	} else {
+		if s.Start != "" {
+			w.state.Start = s.Start
+		}
+		if s.Model != "" {
+			w.metricModel = s.Model
+			if w.state.Model == "" {
+				w.state.Model = s.Model
+			}
+		}
+		if metadata != "" {
+			w.state.Model, w.fingerprint = model, fingerprint
+		}
+		if probe || s.At.Sub(w.touched) >= 30*time.Second {
+			if _, err := a.db.Exec("UPDATE runs SET start=?,model=?,metadata=CASE WHEN ?='' THEN metadata ELSE ? END,last_seen=? WHERE id=?", w.state.Start, w.state.Model, metadata, metadata, s.At.UTC().Format(time.RFC3339Nano), w.state.Run); err != nil {
+				w.state.Error = "会话更新失败"
+			} else {
+				w.touched = s.At
+			}
 		}
 	}
-	if s.Start == "" {
-		w.state.Status = "realtime"
-		w.state.Model = s.Model
+	w.offlineSince = time.Time{}
+	if probe {
+		w.retry = time.Now().Add(30 * time.Second)
 	}
 	maxGap := float64(c.Interval)/1000*3 + 1
 	if c.Record && w.cfg.Record && w.state.Run > 0 && !w.prev.At.IsZero() {
@@ -339,48 +394,7 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 			w.state.Error = "历史写入失败"
 		}
 	}
-	need := s.Start != "" && w.state.Run > 0 && !w.meta && time.Now().After(w.retry)
-	rid := w.state.Run
-	w.retry = time.Now().Add(15 * time.Second)
 	w.mu.Unlock()
-	if need {
-		res, err := a.get(ctx, c, "/v1/models")
-		if err != nil {
-			return
-		}
-		var model struct {
-			Data []struct {
-				ID   string `json:"id"`
-				Root string `json:"root"`
-				Max  int    `json:"max_model_len"`
-			} `json:"data"`
-		}
-		err = json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&model)
-		res.Body.Close()
-		if err != nil || len(model.Data) == 0 {
-			return
-		}
-		check, err := a.snapshot(ctx, c)
-		if err != nil || check.Start != s.Start {
-			return
-		}
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		if w.state.Run != rid || ctx.Err() != nil {
-			return
-		}
-		b, _ := json.Marshal(model)
-		name := model.Data[0].ID
-		for _, m := range model.Data {
-			if m.ID == s.Model {
-				name = m.ID
-			}
-		}
-		if _, err = a.db.Exec("UPDATE runs SET model=?,metadata=? WHERE id=?", name, string(b), rid); err == nil {
-			w.state.Model = name
-			w.meta = true
-		}
-	}
 }
 func (a *App) flush(w *Worker) bool {
 	if len(w.agg) == 0 {
@@ -390,7 +404,13 @@ func (a *App) flush(w *Worker) bool {
 	if e != nil {
 		return false
 	}
-	if _, e = a.db.Exec("INSERT INTO rollups(run_id,at,data) VALUES(?,?,?)", w.state.Run, time.Now().UTC().Format(time.RFC3339Nano), string(b)); e != nil {
+	// A delayed flush after an outage must keep the sample's time, not the
+	// reconnection time, otherwise yesterday's values appear in today's history.
+	at := time.Now()
+	if w.state.Latest.At > 0 {
+		at = time.UnixMilli(w.state.Latest.At)
+	}
+	if _, e = a.db.Exec("INSERT INTO rollups(run_id,at,data) VALUES(?,?,?)", w.state.Run, at.UTC().Format(time.RFC3339Nano), string(b)); e != nil {
 		return false
 	}
 	a.db.Exec("DELETE FROM rollups WHERE at < ?", time.Now().Add(-7*24*time.Hour).UTC().Format(time.RFC3339Nano))
@@ -541,7 +561,7 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (a *App) runs(w http.ResponseWriter, r *http.Request) {
-	rows, e := a.db.Query("SELECT id,start,model,first_seen,last_seen FROM runs WHERE endpoint_id=? ORDER BY id DESC LIMIT 100", r.URL.Query().Get("endpoint"))
+	rows, e := a.db.Query("SELECT id,start,model,first_seen,last_seen,reason FROM runs WHERE endpoint_id=? ORDER BY id DESC LIMIT 100", r.URL.Query().Get("endpoint"))
 	if e != nil {
 		fail(w, e)
 		return
@@ -550,9 +570,9 @@ func (a *App) runs(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var s, m, f, l string
-		rows.Scan(&id, &s, &m, &f, &l)
-		out = append(out, map[string]any{"id": id, "start": s, "model": m, "first_seen": f, "last_seen": l})
+		var s, m, f, l, reason string
+		rows.Scan(&id, &s, &m, &f, &l, &reason)
+		out = append(out, map[string]any{"id": id, "start": s, "model": m, "first_seen": f, "last_seen": l, "reason": reason})
 	}
 	jsonOut(w, out)
 }

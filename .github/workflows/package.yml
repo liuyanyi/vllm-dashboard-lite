@@ -1,0 +1,90 @@
+name: Package
+run-name: Package ${{ inputs.edition }} / ${{ inputs.platform }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      edition:
+        description: Package type
+        type: choice
+        options: [desktop, web]
+        default: desktop
+      platform:
+        description: Target platform (x64 only)
+        type: choice
+        options: [windows, linux]
+        default: windows
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}-${{ inputs.edition }}-${{ inputs.platform }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    # Standard hosted runners are free for public repos. Fail closed if made private.
+    if: github.event.repository.private == false
+    runs-on: ${{ inputs.platform == 'windows' && 'windows-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      CGO_ENABLED: '0'
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            web/package-lock.json
+            desktop/package-lock.json
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build frontend once
+        working-directory: web
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run build
+      - name: Test collector
+        run: go test ./...
+      - name: Build Web executable
+        if: inputs.edition == 'web'
+        shell: bash
+        run: |
+          mkdir -p release
+          suffix=''
+          if [ "$RUNNER_OS" = 'Windows' ]; then suffix='.exe'; fi
+          go build -buildvcs=false -trimpath -ldflags='-s -w' -o "release/vllm-monitor$suffix" .
+      - name: Cache Electron downloads
+        if: inputs.edition == 'desktop'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/electron
+            ~/AppData/Local/electron/Cache
+          key: electron-${{ runner.os }}-${{ hashFiles('desktop/package-lock.json') }}
+      - name: Build desktop directory
+        if: inputs.edition == 'desktop'
+        working-directory: desktop
+        shell: bash
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run prepare:backend
+          node smoke.cjs
+          # Directory packaging avoids installer generation, signing tools, and rebuilds.
+          npx --no-install electron-builder --dir --x64 --publish never --config.win.signAndEditExecutable=false --config.npmRebuild=false
+      - name: Archive selected package
+        run: python scripts/package.py --edition ${{ inputs.edition }} --platform ${{ inputs.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vllm-dashboard-lite-${{ inputs.edition }}-${{ inputs.platform }}-x64
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0

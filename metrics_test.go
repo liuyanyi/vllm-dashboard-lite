@@ -1,7 +1,6 @@
 package main
 
 import (
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -24,19 +23,6 @@ func TestResetAndGap(t *testing.T) {
 	accumulate(a, makeS(now.Add(2*time.Second), 2), makeS(now.Add(10*time.Second), 500), 4)
 	if a["a"].Delta != 10 || a["a"].Duration != 1 || a["a"].Resets != 1 {
 		t.Fatal(a["a"])
-	}
-}
-func TestRunIdentity(t *testing.T) {
-	db, e := openDB(filepath.Join(t.TempDir(), "test.db"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer db.Close()
-	a, _, _, _ := runIdentity(db, "endpoint", "100.1", "modelA")
-	b, m, _, _ := runIdentity(db, "endpoint", "100.1", "modelB")
-	c, _, _, _ := runIdentity(db, "endpoint", "200.1", "modelB")
-	if a != b || a == c || m != "modelA" {
-		t.Fatal(a, b, c, m)
 	}
 }
 func TestHistogramAndWeightedRate(t *testing.T) {

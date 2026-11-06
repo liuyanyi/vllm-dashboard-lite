@@ -7,3 +7,5 @@ vllm-monitor
 desktop/node_modules/
 desktop/bin/
 desktop/release/
+release/
+artifacts/

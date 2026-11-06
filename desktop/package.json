@@ -1,6 +1,6 @@
 {
   "name": "vllm-dashboard-lite-desktop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Desktop launcher for vLLM Dashboard Lite",
   "author": "vllm-dashboard-lite contributors",
   "private": true,
@@ -13,15 +13,36 @@
     "pack": "npm run prepare:backend && electron-builder --dir",
     "dist": "npm run prepare:backend && electron-builder"
   },
-  "devDependencies": {"electron": "^42.0.0", "electron-builder": "^26.0.12"},
+  "devDependencies": {
+    "electron": "^42.0.0",
+    "electron-builder": "^26.0.12"
+  },
   "build": {
     "appId": "io.github.liuyanyi.vllm-dashboard-lite",
     "productName": "vLLM Dashboard Lite",
-    "files": ["main.cjs", "backend.cjs", "package.json"],
-    "extraResources": [{"from":"bin", "to":"backend"}],
-    "directories": {"output":"release"},
-    "win": {"target":"nsis"},
-    "linux": {"target":"AppImage", "category":"Development"},
-    "mac": {"target":"dmg"}
+    "files": [
+      "main.cjs",
+      "backend.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "backend"
+      }
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "win": {
+      "target": "nsis"
+    },
+    "linux": {
+      "target": "AppImage",
+      "category": "Development"
+    },
+    "mac": {
+      "target": "dmg"
+    }
   }
 }
