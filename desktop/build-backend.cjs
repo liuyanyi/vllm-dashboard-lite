@@ -1,0 +1,10 @@
+const {execFileSync}=require('node:child_process');
+const path=require('node:path');const fs=require('node:fs');
+const root=path.resolve(__dirname,'..');
+if (!fs.existsSync(path.join(root,'web/dist/index.html'))) throw Error('Run npm ci && npm run build in web/ first.');
+const dest=path.join(__dirname,'bin');fs.mkdirSync(dest,{recursive:true});
+const name=process.platform==='win32'?'vllm-monitor.exe':'vllm-monitor';
+const platforms={win32:'windows',linux:'linux',darwin:'darwin'};
+const arches={x64:'amd64',arm64:'arm64'};
+if(!platforms[process.platform]||!arches[process.arch])throw Error('Unsupported build platform');
+execFileSync(process.env.GO_BINARY||'go',['build','-buildvcs=false','-trimpath','-o',path.join(dest,name),'.'],{cwd:root,stdio:'inherit',env:{...process.env,CGO_ENABLED:'0',GOOS:platforms[process.platform],GOARCH:arches[process.arch]}});

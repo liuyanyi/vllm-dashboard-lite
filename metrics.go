@@ -19,10 +19,11 @@ type Series struct {
 	Value  float64           `json:"value"`
 }
 type Snapshot struct {
-	At     time.Time
-	Start  string
-	Model  string
-	Values map[string]Series
+	At          time.Time
+	StartStatus string
+	Start       string
+	Model       string
+	Values      map[string]Series
 }
 
 func parseMetrics(r io.Reader) (Snapshot, error) {
@@ -33,6 +34,8 @@ func parseMetrics(r io.Reader) (Snapshot, error) {
 		return s, e
 	}
 	starts := map[string]bool{}
+	seenStart := false
+	invalidStart := false
 	for name, f := range fs {
 		for _, m := range f.Metric {
 			labels := map[string]string{}
@@ -52,8 +55,17 @@ func parseMetrics(r io.Reader) (Snapshot, error) {
 			switch f.GetType() {
 			case dto.MetricType_COUNTER:
 				add(name, "counter", m.GetCounter().GetValue(), labels)
-			case dto.MetricType_GAUGE:
+			case dto.MetricType_GAUGE, dto.MetricType_UNTYPED:
 				v := m.GetGauge().GetValue()
+				if f.GetType() == dto.MetricType_UNTYPED {
+					v = m.GetUntyped().GetValue()
+				}
+				if name == "process_start_time_seconds" {
+					seenStart = true
+					if v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+						invalidStart = true
+					}
+				}
 				add(name, "gauge", v, labels)
 				if name == "process_start_time_seconds" && v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) {
 					starts[fmt.Sprintf("%.9f", v)] = true
@@ -79,7 +91,15 @@ func parseMetrics(r io.Reader) (Snapshot, error) {
 			}
 		}
 	}
-	if len(starts) == 1 {
+	s.StartStatus = "absent"
+	if seenStart {
+		s.StartStatus = "invalid"
+	}
+	if len(starts) > 1 {
+		s.StartStatus = "ambiguous"
+	}
+	if len(starts) == 1 && !invalidStart {
+		s.StartStatus = "available"
 		for v := range starts {
 			s.Start = v
 		}

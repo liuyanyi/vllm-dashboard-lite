@@ -54,3 +54,27 @@ func TestQuantile(t *testing.T) {
 		t.Fatal(v)
 	}
 }
+
+func TestStartAvailability(t *testing.T) {
+	cases := []struct{ input, status string }{
+		{"# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running 1\n", "absent"},
+		{"process_start_time_seconds 123.5\n", "available"},
+		{"# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds NaN\n", "invalid"},
+		{"# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds{pid=\"1\"} 100\nprocess_start_time_seconds{pid=\"2\"} 200\n", "ambiguous"},
+	}
+	for _, c := range cases {
+		s, e := parseMetrics(strings.NewReader(c.input))
+		if e != nil || s.StartStatus != c.status {
+			t.Fatalf("status %s expected %s: %v", s.StartStatus, c.status, e)
+		}
+	}
+}
+func TestEndpointOrderStable(t *testing.T) {
+	a := &App{workers: map[string]*Worker{"b": {cfg: Config{ID: "b", URL: "http://gpu:8001"}}, "a": {cfg: Config{ID: "a", URL: "http://gpu:8000"}}}}
+	for i := 0; i < 100; i++ {
+		s := a.states(false)
+		if s[0].Config.ID != "a" || s[1].Config.ID != "b" {
+			t.Fatal(s)
+		}
+	}
+}

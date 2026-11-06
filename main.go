@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -17,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,15 +43,16 @@ type Point struct {
 	Values map[string]*float64 `json:"values"`
 }
 type State struct {
-	Config Config   `json:"config"`
-	Status string   `json:"status"`
-	Error  string   `json:"error,omitempty"`
-	Run    int64    `json:"run"`
-	Start  string   `json:"start"`
-	Model  string   `json:"model"`
-	Latest Point    `json:"latest"`
-	Points []Point  `json:"points"`
-	Raw    []Series `json:"raw,omitempty"`
+	Config      Config   `json:"config"`
+	Status      string   `json:"status"`
+	Error       string   `json:"error,omitempty"`
+	Run         int64    `json:"run"`
+	Start       string   `json:"start"`
+	StartStatus string   `json:"start_status"`
+	Model       string   `json:"model"`
+	Latest      Point    `json:"latest"`
+	Points      []Point  `json:"points"`
+	Raw         []Series `json:"raw,omitempty"`
 }
 type Worker struct {
 	mu     sync.Mutex
@@ -74,6 +77,7 @@ type App struct {
 func main() {
 	addr := flag.String("listen", "127.0.0.1:9090", "listen address")
 	path := flag.String("db", "monitor.db", "SQLite file")
+	desktopChild := flag.Bool("desktop-child", false, "stop when desktop stdin closes")
 	flag.Parse()
 	db, e := openDB(*path)
 	if e != nil {
@@ -82,6 +86,17 @@ func main() {
 	defer db.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if *desktopChild {
+		go func() {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				if scanner.Text() == "shutdown" {
+					break
+				}
+			}
+			cancel()
+		}()
+	}
 	a := &App{workers: map[string]*Worker{}, db: db, ctx: ctx, client: &http.Client{Timeout: 4 * time.Second}}
 	rows, e := db.Query("SELECT config FROM endpoints")
 	if e != nil {
@@ -118,8 +133,15 @@ func main() {
 		defer done()
 		srv.Shutdown(c)
 	}()
-	log.Printf("vLLM Monitor http://%s", *addr)
-	if e = srv.ListenAndServe(); e != http.ErrServerClosed {
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("vLLM Monitor http://%s", listener.Addr().String())
+	if *desktopChild {
+		fmt.Printf("MONITOR_READY http://%s\n", listener.Addr().String())
+	}
+	if e = srv.Serve(listener); e != http.ErrServerClosed {
 		log.Fatal(e)
 	}
 	a.mu.Lock()
@@ -241,6 +263,7 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 		return
 	}
 	w.state.Error = ""
+	w.state.StartStatus = s.StartStatus
 	w.state.Status = "online"
 	if s.Start != w.state.Start {
 		if !a.flush(w) {
@@ -393,6 +416,12 @@ func (a *App) states(full bool) []State {
 		out = append(out, s)
 		w.mu.Unlock()
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Config.URL == out[j].Config.URL {
+			return out[i].Config.ID < out[j].Config.ID
+		}
+		return out[i].Config.URL < out[j].Config.URL
+	})
 	return out
 }
 func (a *App) list(w http.ResponseWriter, r *http.Request) { jsonOut(w, a.states(true)) }
