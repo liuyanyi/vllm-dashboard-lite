@@ -3,9 +3,7 @@
 endpoints:
   - id: qwen-embed
     name: Qwen3 Embedding
-    backend: tei
-    task: embedding
-    model: Qwen/Qwen3-Embedding-0.6B
+    # TEI /info supplies backend, task, and model automatically.
     url: http://host.docker.internal:8001
     metrics_path: /metrics
     interval: 2000

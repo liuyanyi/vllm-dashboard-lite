@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -34,9 +33,6 @@ func loadStaticConfig(r io.Reader) ([]Config, error) {
 		c := &file.Endpoints[i]
 		if !endpointID.MatchString(c.ID) {
 			return nil, fmt.Errorf("config: endpoint %d requires a stable alphanumeric id (also . _ -)", i+1)
-		}
-		if c.Backend == "" || c.Task == "" || strings.TrimSpace(c.Model) == "" {
-			return nil, fmt.Errorf("config: endpoint %s requires backend, task and model", c.ID)
 		}
 		if err := valid(c); err != nil {
 			return nil, fmt.Errorf("config: endpoint %s: %w", c.ID, err)

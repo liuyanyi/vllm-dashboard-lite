@@ -30,7 +30,6 @@ func TestStaticConfig(t *testing.T) {
 	for _, invalid := range []string{
 		strings.Replace(staticYAML, "backend: tei", "backend: unknown", 1),
 		strings.Replace(staticYAML, "task: embedding", "task: generation", 1),
-		strings.Replace(staticYAML, "model: example/model", "model: ''", 1),
 		staticYAML + "    typo: value\n",
 		staticYAML + strings.TrimPrefix(staticYAML, "endpoints:\n"),
 		staticYAML + "---\nendpoints: []\n",
@@ -45,7 +44,7 @@ func TestStaticConfig(t *testing.T) {
 	}
 }
 
-func TestStaticCollectionNoDiscovery(t *testing.T) {
+func TestStaticCollectionMetadataFailureKeepsConfiguredModel(t *testing.T) {
 	discovery := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/metrics" {
@@ -65,7 +64,7 @@ func TestStaticCollectionNoDiscovery(t *testing.T) {
 	w := &Worker{cfg: Config{ID: "static", URL: server.URL, MetricsPath: "/metrics", Interval: 1000, Backend: "vllm", Task: "reranker", Model: "configured"}, agg: map[string]*Aggregate{}}
 	a.collect(context.Background(), w)
 	a.collect(context.Background(), w)
-	if discovery != 0 || w.state.Model != "configured" || w.state.Run == 0 || w.state.Status != "online" {
+	if discovery < 1 || w.state.Model != "configured" || w.state.Run == 0 || w.state.Status != "online" {
 		t.Fatal(discovery, w.state)
 	}
 

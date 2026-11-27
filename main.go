@@ -34,6 +34,7 @@ type Config struct {
 	Record      bool   `json:"record" yaml:"record"`
 	Interval    int    `json:"interval" yaml:"interval"`
 	MetricsPath string `json:"metrics_path" yaml:"metrics_path"`
+	MetadataURL string `json:"metadata_url,omitempty" yaml:"metadata_url"`
 	Backend     string `json:"backend" yaml:"backend"`
 	Task        string `json:"task" yaml:"task"`
 	Model       string `json:"model,omitempty" yaml:"model"`
@@ -52,6 +53,7 @@ type State struct {
 	FirstSeen   string   `json:"first_seen"`
 	Reason      string   `json:"reason"`
 	Model       string   `json:"model"`
+	Metadata    Metadata `json:"metadata"`
 	Latest      Point    `json:"latest"`
 	Points      []Point  `json:"points"`
 	Raw         []Series `json:"raw,omitempty"`
@@ -67,6 +69,9 @@ type Worker struct {
 	offlineSince time.Time
 	touched      time.Time
 	manual       bool
+	remote       Metadata
+	nextMetadata time.Time
+	runModel     string
 }
 type App struct {
 	mu      sync.Mutex
@@ -173,23 +178,27 @@ func jsonOut(w http.ResponseWriter, v any) {
 func fail(w http.ResponseWriter, e error) { http.Error(w, e.Error(), 400) }
 func valid(c *Config) error {
 	c.Model = strings.TrimSpace(c.Model)
-	if c.Backend != "vllm" && c.Backend != "tei" {
+	if c.Backend != "" && c.Backend != "vllm" && c.Backend != "tei" {
 		return fmt.Errorf("backend must be vllm or tei")
 	}
-	if c.Task != "generation" && c.Task != "embedding" && c.Task != "reranker" {
+	if c.Task != "" && c.Task != "generation" && c.Task != "embedding" && c.Task != "reranker" {
 		return fmt.Errorf("task must be generation, embedding or reranker")
 	}
-	if c.Model == "" {
-		return fmt.Errorf("model is required")
-	}
 	if c.Backend == "tei" && c.Task == "generation" {
-		return fmt.Errorf("TEI requires a configured model and embedding or reranker task")
+		return fmt.Errorf("TEI does not support generation")
 	}
 	u, e := url.Parse(c.URL)
 	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("请输入有效 http(s) 服务地址")
 	}
 	c.URL = strings.TrimRight(c.URL, "/")
+	if c.MetadataURL != "" {
+		m, err := url.Parse(c.MetadataURL)
+		if err != nil || m.Host == "" || (m.Scheme != "http" && m.Scheme != "https") || m.User != nil || m.RawQuery != "" || m.Fragment != "" {
+			return fmt.Errorf("metadata_url must be a valid http(s) base URL")
+		}
+		c.MetadataURL = strings.TrimRight(c.MetadataURL, "/")
+	}
 	if c.Interval == 0 {
 		c.Interval = 1000
 	}
@@ -255,8 +264,27 @@ func (a *App) snapshot(ctx context.Context, c Config) (Snapshot, error) {
 func (a *App) collect(ctx context.Context, w *Worker) {
 	w.mu.Lock()
 	c := w.cfg
+	remote, next := w.remote, w.nextMetadata
+	previousStart, offline := w.state.Start, w.offlineSince
 	w.mu.Unlock()
 	s, e := a.snapshot(ctx, c)
+	var meta Metadata
+	if e == nil {
+		metrics := metadataFromMetrics(s)
+		restarted := s.Start != "" && previousStart != "" && s.Start != previousStart
+		if restarted || (!offline.IsZero() && s.At.Sub(offline) >= 30*time.Second) {
+			remote, next = Metadata{}, time.Time{}
+		}
+		if next.IsZero() || time.Now().After(next) || !offline.IsZero() {
+			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			if found, ok := a.fetchMetadata(probeCtx, c, metrics); ok {
+				remote = found
+			}
+			cancel()
+			next = time.Now().Add(60*time.Second)
+		}
+		meta = resolveMetadata(c, metrics, remote)
+	}
 	w.mu.Lock()
 	if ctx.Err() != nil {
 		w.mu.Unlock()
@@ -283,6 +311,8 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 	w.state.Error = ""
 	w.state.Status = "online"
 	w.state.StartStatus = s.StartStatus
+	w.remote, w.nextMetadata = remote, next
+	w.state.Metadata = meta
 	reason := sessionReason(w, s)
 	if reason != "" {
 		if !a.flush(w) {
@@ -293,13 +323,15 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 		if w.state.Run > 0 && !w.prev.At.IsZero() {
 			a.db.Exec("UPDATE runs SET last_seen=? WHERE id=?", w.prev.At.UTC().Format(time.RFC3339Nano), w.state.Run)
 		}
-		rid, err := createSession(a.db, c.ID, s.Start, c.Model, "", reason, s.At)
+		metadataJSON, _ := json.Marshal(meta)
+		rid, err := createSession(a.db, c.ID, s.Start, meta.Model, string(metadataJSON), reason, s.At)
 		if err != nil {
 			w.state.Error = "无法保存会话"
 			w.mu.Unlock()
 			return
 		}
-		w.state.Run, w.state.Model, w.state.Start = rid, c.Model, s.Start
+		w.state.Run, w.state.Model, w.state.Start = rid, meta.Model, s.Start
+		w.runModel = meta.Model
 		w.state.FirstSeen, w.state.Reason = s.At.UTC().Format(time.RFC3339Nano), reason
 		w.prev, w.recent, w.state.Points = Snapshot{}, nil, []Point{}
 		w.manual = false
@@ -307,6 +339,17 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 	} else {
 		if s.Start != "" {
 			w.state.Start = s.Start
+		}
+		w.state.Model = meta.Model
+		// Fill a previously unknown session label once, without relabeling
+		// earlier observations or cutting sessions when metadata changes.
+		if w.runModel == "" && meta.Model != "" {
+			metadataJSON, _ := json.Marshal(meta)
+			if _, err := a.db.Exec("UPDATE runs SET model=?,metadata=? WHERE id=? AND model=''", meta.Model, string(metadataJSON), w.state.Run); err == nil {
+				w.runModel = meta.Model
+			} else {
+				w.state.Error = "会话元数据更新失败"
+			}
 		}
 		if s.At.Sub(w.touched) >= 30*time.Second {
 			if _, err := a.db.Exec("UPDATE runs SET start=?,last_seen=? WHERE id=?", w.state.Start, s.At.UTC().Format(time.RFC3339Nano), w.state.Run); err != nil {
@@ -394,6 +437,16 @@ func (a *App) states(full bool) []State {
 		s := w.state
 		s.Config = w.cfg
 		s.Config.Token = ""
+		// Present effective configuration while retaining immutable YAML in Worker.
+		if s.Config.Backend == "" {
+			s.Config.Backend = s.Metadata.Backend
+		}
+		if s.Config.Task == "" {
+			s.Config.Task = s.Metadata.Task
+		}
+		if s.Config.Model == "" {
+			s.Config.Model = s.Model
+		}
 		if full {
 			s.Points = append([]Point{}, s.Points...)
 			s.Raw = append([]Series{}, s.Raw...)
@@ -448,7 +501,7 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (a *App) runs(w http.ResponseWriter, r *http.Request) {
-	rows, e := a.db.Query("SELECT id,start,model,first_seen,last_seen,reason FROM runs WHERE endpoint_id=? ORDER BY id DESC LIMIT 100", r.URL.Query().Get("endpoint"))
+	rows, e := a.db.Query("SELECT id,start,model,first_seen,last_seen,reason,metadata FROM runs WHERE endpoint_id=? ORDER BY id DESC LIMIT 100", r.URL.Query().Get("endpoint"))
 	if e != nil {
 		fail(w, e)
 		return
@@ -457,9 +510,11 @@ func (a *App) runs(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var s, m, f, l, reason string
-		rows.Scan(&id, &s, &m, &f, &l, &reason)
-		out = append(out, map[string]any{"id": id, "start": s, "model": m, "first_seen": f, "last_seen": l, "reason": reason})
+		var s, m, f, l, reason, raw string
+		rows.Scan(&id, &s, &m, &f, &l, &reason, &raw)
+		var meta Metadata
+		_ = json.Unmarshal([]byte(raw), &meta)
+		out = append(out, map[string]any{"id": id, "start": s, "model": m, "first_seen": f, "last_seen": l, "reason": reason, "metadata": meta})
 	}
 	jsonOut(w, out)
 }
