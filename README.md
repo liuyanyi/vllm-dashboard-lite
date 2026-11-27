@@ -2,57 +2,58 @@
 
 直连 vLLM / TEI `/metrics` 的轻量推理监控看板，支持 Generation、Embedding、Reranker。Go + React/TypeScript + Vite + Tailwind/shadcn 风格基础组件 + ECharts + TanStack Query + Zustand + SQLite。
 
-## 运行
+## 运行（YAML-only）
 
-本仓库保存源码。请先按下方“开发”步骤构建，或使用 Docker 构建运行。已有可执行文件时，Windows 运行 `vllm-monitor.exe`；Linux/WSL：
-
-```bash
-chmod +x vllm-monitor
-./vllm-monitor
-```
-
-浏览器打开 http://127.0.0.1:9090 。默认 SQLite 文件为当前目录 `monitor.db`。配置和 Bearer Token 存在本地数据库，请保护该文件。
+复制 `config.example.yaml` 为 `monitor.yaml`，根据实际服务修改。配置中只声明需要采集的端点，不需要 Prometheus，也不需要模型服务支持自动发现。
 
 ```bash
-./vllm-monitor -listen 0.0.0.0:9090 -db /path/monitor.db
-```
-
-程序没有多用户登录，仅用于可信本地或实验内网。默认只绑定回环地址。远端使用 SSH 端口转发，避免公开到互联网。
-
-Docker：`docker compose up -d --build`。在 Docker 中，`localhost` 指容器本身，访问宿主机服务请使用 `host.docker.internal` 或实际服务器 IP。服务必须监听容器可达地址。默认宿主端口仍仅暴露在 127.0.0.1。
-
-## YAML 静态配置（无需自动发现）
-
-复制 `config.example.yaml` 为 `monitor.yaml`，修改每个端点的 URL 和模型信息。以静态模式启动：
-
-```bash
+cp config.example.yaml monitor.yaml
 ./vllm-monitor -config monitor.yaml -db monitor.db
-# Docker
-docker compose -f compose.yaml -f compose.static.yaml up -d --build
+# 或直接运行（默认读取当前目录 monitor.yaml）
+./vllm-monitor
+# Docker：先创建 monitor.yaml，再启动
+docker compose up -d --build
 ```
 
-也可设置环境变量 `VLLM_DASHBOARD_CONFIG` 指向 YAML 文件（Web、桌面版均支持，建议使用绝对路径）。修改 YAML 后重启采集器生效。
+浏览器打开 http://127.0.0.1:9090。Windows 可执行文件同样支持 `-config`。也可设置环境变量 `VLLM_DASHBOARD_CONFIG`（推荐绝对路径）；显式 CLI 参数优先。缺少配置文件或字段无效时启动失败。使用 `endpoints: []` 可启动空总览。修改 YAML 后重启采集器生效。
 
-- 每个端点需要唯一且稳定的 `id`、`backend`（vllm / tei）、`task`（generation / embedding / reranker）、`model` 和 `url`；`name` 为可选显示名称。
-- `metrics_path` 默认 /metrics，`interval` 以毫秒为单位（默认 1000），`record` 控制历史记录；可选 `token` 用于 Bearer 鉴权。保护包含 Token 的 YAML 文件。
-- 指标端口与推理端口不同（例如 TEI --prometheus-port）时，直接填写可达的指标服务 URL。
-- 静态模式只使用 YAML 声明的端点，不加载数据库保存的端点，不扫描端口，不访问 /v1/models 或 /info，也不根据 model_name 标签修改模型身份。添加、修改、删除及扫描 API 会返回 403；UI 相应控件禁用/隐藏。SQLite 仍用于历史数据，手动观测会话保留。
-- ID 是历史记录的稳定关联键；更换模型、后端或任务类型时使用新 ID。YAML 按启动时读取，不热加载。进程启动时间和会话切分仍以实际指标为准，未提供的指标显示缺失。
-- 静态模式按 `backend` + `task` 选择页面。TEI 分别显示 API 请求、文本/文档对、截断后的输入 Token、等待队列、请求延迟、每输入阶段耗时和每次调度轮询（含空轮询）平均批大小/Token 数；不计算不可靠的失败比例。vLLM 非生成式页面区分 HTTP API 请求与引擎完成项，指标缺失时不填零。
-- 不新增 Prometheus 服务，不从 Gateway 推断后端指标；直接抓取每个后端的 metrics。未集成 NVML，GPU 物理利用率和每进程显存不属于本次变更。
+```yaml
+endpoints:
+  - id: qwen-embed
+    name: Qwen3 Embedding
+    backend: tei
+    task: embedding
+    model: Qwen/Qwen3-Embedding-0.6B
+    url: http://host.docker.internal:8001
+    interval: 2000
+    record: true
+  - id: qwen-rerank
+    backend: vllm
+    task: reranker
+    model: Qwen/Qwen3-Reranker-0.6B
+    url: http://host.docker.internal:8002
+    record: true
+```
 
-TEI 指标口径参考 [官方 Metrics 文档](https://huggingface.co/docs/text-embeddings-inference/main/en/metrics)，vLLM 指标参考 [官方 Metrics 文档](https://docs.vllm.ai/en/latest/usage/metrics/)。
+- 每个端点需要唯一且稳定的 `id`、`backend`（vllm / tei）、`task`（generation / embedding / reranker）、`model` 和 `url`；`name` 是可选显示名称。模型名与显示名可以重复。端点 URL + metrics_path 不得重复，避免同一地址重复采集。
+- `metrics_path` 默认 /metrics；`interval` 为毫秒（默认 1000，允许 500–10000）；`record` 决定是否记录历史（默认 false）；可选 `token` 用于 Bearer 鉴权。请保护含 Token 的 YAML。
+- Docker 默认以只读方式挂载 monitor.yaml，宿主服务可使用 host.docker.internal 或服务器 IP；localhost 指容器自身。指标端口不同（例如 TEI --prometheus-port）时直接填写指标 URL。默认只在宿主回环端口提供 UI。
+- 程序没有多用户登录，仅用于可信本地或实验内网。不要公开到互联网。
 
-## 使用（未提供 YAML 时）
+## 使用
 
-- 点击侧栏加号添加 `http://GPU服务器:8000`，可配置 Bearer Token 和 metrics 路径。
-- 扫描指定主机的端口范围，发现后点击添加。扫描仅请求 metrics，不发送推理请求。
-- 单层服务列表，vLLM 默认自动识别；可手动指定后端、任务和模型名称（TEI 模型名称必填）；每个端点独立维护观测会话。缺少启动时间也可以记录历史。
-- 未显式指定模型名称的 vLLM 端点在首次连接、恢复连接、身份线索变化和每 30 秒查询 `/v1/models`；比较模型 ID/root，忽略 created、权限和列表顺序。查询失败保留已有信息。
+首页总览按 Generation 与 Embedding / Reranker 分组展示实例、状态、吞吐、队列与 P95，可点击进入原有详细视图。侧栏按 YAML 顺序显示，ID 区分同名实例。总览吞吐汇总标记有数据的实例数量，不平均各实例 P95，不混合不同单位的请求/样本数。未连接、离线、缺失或陈旧数据显示缺失。
+
+- YAML 是唯一配置来源。已删除端口扫描、模型发现、/v1/models 元数据查询、模型 fingerprint、Web 增删修改端点 API 与 UI。原始指标标签仍保留用于统计，不用来确定实例身份。
+- ID 关联历史记录；修改显示名/模型名无需避让，重启监控程序会按新配置创建新观测会话，旧会话的模型名不变。若更换 backend/task 或将 ID 用于无关服务，请使用新 ID，避免旧指标混用。
 - 1 秒默认采样，10 秒吞吐窗口，60 秒延迟窗口，内存保留 30 分钟。首次需要两个有效样本才能显示速率。
-- 打开“记录”保存 30 秒聚合窗口，默认保留 7 天；关闭记录会刷新当前有效窗口。不保存开启记录之前的内存数据。
-- 会话选择器查看历史，原始指标查看全部已解析 Gauge/Counter/Histogram 序列。
-- 模型 ID/root 变化、有效进程启动时间变化、连续离线至少 30 秒后恢复时开启新会话。短暂离线只保留缺口；Counter 回退只重置速率，不切分会话。点击“新会话”会在下一次成功采样时开始记录新的会话。
+- record: true 保存约 30 秒聚合窗口，默认保留 7 天。会话选择器与原始指标继续可用。
+- 首次观测、有效进程启动时间变化、连续离线至少 30 秒后恢复、手动新会话时切分。短暂离线保留缺口；Counter 回退只重置速率。上游实际换模型但不修改 YAML 不会自动发现，须由使用者维护配置。
+- TEI 展示 API 请求、文本/文档对、输入 Token、等待队列、请求延迟、阶段耗时和每次调度轮询平均批大小/Token 数；vLLM 非生成式页面区分 HTTP API 请求与引擎完成项。未提供指标不填零。
+- SQLite 仅用于观测会话和历史，旧库的 endpoints 表不会加载、修改或删除。已有历史如需沿用，可手动在 YAML 中使用原 ID（旧表存在时可用 `SELECT id,json_extract(config,'$.url') FROM endpoints;` 查阅）。无需自动迁移配置。
+- 不增加 Prometheus 服务，不集成 NVML；直接抓取后端 metrics。
+
+TEI 指标参考 [官方 Metrics 文档](https://huggingface.co/docs/text-embeddings-inference/main/en/metrics)，vLLM 指标参考 [官方 Metrics 文档](https://docs.vllm.ai/en/latest/usage/metrics/)。
 
 ## 开发
 
@@ -80,17 +81,17 @@ Go 测试覆盖启动时间解析、Counter 回退/采集缺口、会话切分�
 
 ```bash
 python3 scripts/mock_vllm.py
-./vllm-monitor -db test.db
+./vllm-monitor -config scripts/integration.yaml -db test.db
 python3 scripts/integration.py
 ```
 
-模拟器只用于验证，真实服务不注入任何模拟数据。集成测试使用不提供启动时间的模拟端点，验证实时速率、元数据查询间隔、同端口换模型切分、旧会话模型不变、历史刷新、扫描和记录开关。
+模拟器仅用于验证。更新后的集成测试检查 YAML-only 启动、实时速率、进程变化切分、历史保留、无元数据查询及已移除的动态配置接口；新增总览逻辑和同名模型配置测试。
 
 ## 当前实现边界
 
-当前版本为 v0.3。现有面板覆盖吞吐、Running/Waiting、完成速率、缓存、TTFT/ITL/TPOT 均值、TTFT P95 与 MTP 总体接受情况。后端也保存 Histogram bucket 增量和 Gauge 极值，支持后续扩展。
+本次扩展在 v0.3 基础上增加 YAML-only、总览、TEI 和 Pooling。现有面板覆盖吞吐、Running/Waiting、完成速率、缓存、TTFT/ITL/TPOT 均值、TTFT P95 与 MTP 总体接受情况。后端也保存 Histogram bucket 增量和 Gauge 极值，支持后续扩展。
 
-尚未完成：逐个 vLLM 版本的全部日志指标覆盖验收、MTP 各位置图、独立 Engine 明细、自动周期扫描、主题切换、可配置保留期、完整元数据清理、历史导出。扩展指标目前可在原始指标中查看；不声称全部日志已由专用图表覆盖。历史曲线当前显示窗口均值/速率，Gauge 极值仍保存在数据库。P95 为 bucket 插值估计，落入无限 bucket 时返回缺失。
+尚未完成：逐个 vLLM 版本的全部日志指标覆盖验收、MTP 各位置图、独立 Engine 明细、主题切换、可配置保留期、完整元数据清理、历史导出。扩展指标目前可在原始指标中查看；不声称全部日志已由专用图表覆盖。历史曲线当前显示窗口均值/速率，Gauge 极值仍保存在数据库。P95 为 bucket 插值估计，落入无限 bucket 时返回缺失。
 
 面向直连单个服务端点；负载均衡后端交替返回多个实例时，无法可靠切分各实例。观测会话只代表可观察的连续区间，不保证与进程生命周期一一对应。窗口聚合以有效采样间隔归入窗口，约 30 秒，不保证整点边界。实际断连与进程重启只能在下一次采样时观察到。
 
@@ -119,7 +120,7 @@ npm start
 
 桌面启动脚本会编译当前平台的 Go 后端，需要 Go 在 PATH 中，或设置 GO_BINARY。正式安装包内嵌后端，用户不需要安装 Go/Node.js。窗口默认 1440×960，字体及控件仍按 100% 桌面缩放呈现。
 
-桌面端仅监听 127.0.0.1 随机可用端口。默认数据库在 Electron 的用户数据目录（Windows 通常是 `%APPDATA%/vllm-dashboard-lite-desktop/monitor.db`）；需要和 Web 模式使用同一个数据库时，可设置绝对路径环境变量 `VLLM_DASHBOARD_DB`，并在两种模式之间先退出原进程，不要同时采集同一个数据库。关闭窗口会向后端发送退出指令，刷新聚合窗口后退出；父进程异常退出导致 stdin 关闭时，后端也会退出。
+桌面端仅监听 127.0.0.1 随机可用端口。默认在 Electron 用户数据目录使用 monitor.yaml，首次运行只创建空配置；编辑此文件并重启即可。使用 VLLM_DASHBOARD_CONFIG 指定其他 YAML 时，文件必须存在。默认数据库在 Electron 的用户数据目录（Windows 通常是 `%APPDATA%/vllm-dashboard-lite-desktop/monitor.db`）；需要和 Web 模式使用同一个数据库时，可设置绝对路径环境变量 `VLLM_DASHBOARD_DB`，并在两种模式之间先退出原进程，不要同时采集同一个数据库。关闭窗口会向后端发送退出指令，刷新聚合窗口后退出；父进程异常退出导致 stdin 关闭时，后端也会退出。
 
 桌面打包在目标系统执行：
 
@@ -149,7 +150,7 @@ Dashboard 支持 Gauge 及省略 TYPE 的数值字段，并区分未暴露、无
 
 ## v0.2 修改
 
-- 服务列表按端点 URL、ID 固定排序，不受 map 遍历、状态变化或 SSE 刷新影响。
+- 旧版按 URL/ID 固定排序，当前版本改为按 YAML 顺序。
 - 增加独立桌面启动器、随机回环端口、用户数据目录、单实例窗口和后端退出管理。
 - 更准确地报告启动时间缺失原因，增加无 TYPE 指标解析和相应测试。
 
@@ -160,8 +161,8 @@ Dashboard 支持 Gauge 及省略 TYPE 的数值字段，并区分未暴露、无
 - 会话信息分别显示“观测开始”和“进程启动”；不使用 `/v1/models.created` 推断启动时间。
 - 监控程序重新启动后，首次成功采样创建新会话，旧历史保留。新会话使用独立数据库 ID，因此相同端口、相同模型、相同启动时间也能手动分开记录。
 - 旧数据库自动迁移，保留原 run ID 与关联聚合数据；数据库升级后不建议用旧版程序继续写入。
-- 模型/root 变化最迟在下一次元数据查询时发现，发现时切分；查询间隔内发生的精确切换时刻无法追溯。
-- 同名、同路径模型快速重启，且上游没有提供启动标识时，可能无法自动发现。需要严格实验边界时点击“新会话”。
+- 旧版的模型/root 自动发现机制已移除。模型配置变更后重启，创建新会话。
+- 上游没有启动标识时，短时间重启可能无法检测。需要严格实验边界时点击“新会话”。
 - 历史接口继续使用 `/api/runs` 和 `/api/history?run=...`；新会话接口为 `POST /api/endpoints/{id}/sessions`，返回 202 表示已排队。
 
 ## 手动打包 CI

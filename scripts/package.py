@@ -15,6 +15,7 @@ source = root / ('release' if args.edition == 'web' else 'desktop/release/' + ('
 if not source.is_dir() or not any(source.iterdir()):
     raise SystemExit(f'Missing build directory: {source}')
 shutil.copy2(root / 'README.md', source / 'README.md')
+shutil.copy2(root / 'config.example.yaml', source / 'config.example.yaml')
 out = root / 'artifacts'
 out.mkdir(exist_ok=True)
 name = f'vllm-dashboard-lite-{args.edition}-{args.platform}-x64'

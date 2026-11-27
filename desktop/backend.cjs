@@ -1,7 +1,8 @@
 const {spawn}=require('node:child_process');
 const {createInterface}=require('node:readline');
-function startBackend(binary,db,{timeout=15000,spawnFn=spawn}={}) {
- const child=spawnFn(binary,['-listen','127.0.0.1:0','-db',db,'-desktop-child'],{stdio:['pipe','pipe','pipe'],windowsHide:true});
+function startBackend(binary,db,{timeout=15000,spawnFn=spawn,config}={}) {
+ const args=['-listen','127.0.0.1:0','-db',db,'-desktop-child'];if(config)args.push('-config',config);
+ const child=spawnFn(binary,args,{stdio:['pipe','pipe','pipe'],windowsHide:true});
  let stderr='';child.stderr.on('data',b=>{stderr=(stderr+b.toString()).slice(-4096)});
  const ready=new Promise((resolve,reject)=>{
   const lines=createInterface({input:child.stdout});

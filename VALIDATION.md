@@ -27,3 +27,7 @@
 - Linux 桌面目录打包成功；归档包含 Electron、app.asar、Go 后端，保留可执行权限。未运行原生窗口。
 - Linux 与 Windows x64 Web 可执行文件构建和归档成功。Windows 二进制未实际运行，Windows Electron 包需在目标 runner 验证。
 - 工作流 YAML 静态检查通过：只有手动触发、单目标、公开仓库限制、20 分钟超时、1 天产物保留。未主动触发 GitHub Actions；远端 runner 上的完整执行尚未验证。
+
+# YAML-only / 总览扩展（未执行）
+
+新增或更新 Go、Vitest、集成、Playwright、桌面启动测试，覆盖同名实例、静态配置、进程切分、旧历史、禁用发现、总览指标与陈旧数据处理。当前环境尚未运行完整构建及这些测试；此前 v0.1–v0.3 记录仅适用于当时版本。
