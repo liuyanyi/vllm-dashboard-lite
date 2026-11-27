@@ -1,0 +1,20 @@
+# Standalone deployment using an already built runtime image.
+# No Dockerfile or source tree is required on the deployment machine.
+services:
+  monitor:
+    image: ${MONITOR_IMAGE:-vllm-dashboard-lite:latest}
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - monitor-data:/data
+      - type: bind
+        source: ./monitor.yaml
+        target: /etc/monitor/monitor.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+volumes:
+  monitor-data:

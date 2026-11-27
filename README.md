@@ -40,6 +40,45 @@ endpoints:
 - Docker 默认以只读方式挂载 monitor.yaml，宿主服务可使用 host.docker.internal 或服务器 IP；localhost 指容器自身。指标端口不同（例如 TEI --prometheus-port）时直接填写指标 URL。默认只在宿主回环端口提供 UI。
 - 程序没有多用户登录，仅用于可信本地或实验内网。不要公开到互联网。
 
+## Docker 构建与独立部署
+
+同一个 Dockerfile 提供两个公开构建目标：
+
+| 目标 | 镜像标签示例 | 内容 |
+| --- | --- | --- |
+| build | vllm-dashboard-lite:build | Go 构建环境、源码、嵌入式前端、已编译的 Linux 二进制 |
+| runtime（默认） | vllm-dashboard-lite:latest | Alpine、CA 证书、非 root 用户、最终二进制 |
+
+前端使用独立 Node.js 阶段编译，构建阶段执行前端测试、TypeScript 检查及 Go 测试。BuildKit 缓存 npm、Go modules 和编译缓存。
+
+```bash
+# 可选：单独构建/保存 builder 镜像
+docker build --target build -t vllm-dashboard-lite:build .
+# 构建最终服务镜像（默认也会完成必要的编译，复用缓存）
+docker build --target runtime -t vllm-dashboard-lite:latest .
+# 默认 Compose 仍可直接构建并启动最终镜像
+docker compose up -d --build
+```
+
+如需提取编译产物：
+
+```bash
+cid=$(docker create vllm-dashboard-lite:build)
+docker cp "$cid":/out/vllm-monitor ./vllm-monitor
+docker rm "$cid"
+```
+
+若部署机器不需要源码或编译环境，只需预构建 runtime 镜像、`compose.runtime.yaml` 和 `monitor.yaml`：
+
+```bash
+docker save -o vllm-dashboard-lite.tar vllm-dashboard-lite:latest
+# 在目标机器导入镜像，再启动
+docker load -i vllm-dashboard-lite.tar
+docker compose -f compose.runtime.yaml up -d --no-build
+```
+
+也可将镜像上传至自选 registry，通过 `MONITOR_IMAGE` 指定镜像名和标签。项目没有自动发布镜像或自动触发构建 CI。两个 Compose 文件均使用 monitor-data 持久化数据库，只读挂载 YAML；同一部署不要同时启动两套 Compose。默认监听宿主机回环端口，运行容器 UID 为 10001，配置文件必须对该用户可读。
+
 ## 使用
 
 首页总览按 Generation 与 Embedding / Reranker 分组展示实例、状态、吞吐、队列与 P95，可点击进入原有详细视图。侧栏按 YAML 顺序显示，ID 区分同名实例。总览吞吐汇总标记有数据的实例数量，不平均各实例 P95，不混合不同单位的请求/样本数。未连接、离线、缺失或陈旧数据显示缺失。

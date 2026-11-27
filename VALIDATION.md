@@ -35,3 +35,7 @@
 # 已配置端点元数据补全（未执行）
 
 新增 TEI /info、vLLM 指标与多模型标签、最小 YAML、显式覆盖、名称变化不切分等测试。尚未运行构建或真实服务验证。
+
+# Docker 独立 build/runtime targets（未执行）
+
+新增独立 build/runtime 构建目标、构建时单元测试、BuildKit 缓存及预构建镜像部署 Compose。当前环境未执行 Docker 构建或运行容器，不能声明构建已通过。

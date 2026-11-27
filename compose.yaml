@@ -1,6 +1,9 @@
 services:
   monitor:
-    build: .
+    image: vllm-dashboard-lite:latest
+    build:
+      context: .
+      target: runtime
     ports:
       - "127.0.0.1:9090:9090"
     volumes:

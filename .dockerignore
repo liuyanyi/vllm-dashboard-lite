@@ -6,3 +6,6 @@ vllm-monitor
 desktop/
 release/
 artifacts/
+
+monitor.yaml
+.env
