@@ -216,12 +216,14 @@ func summaries(a map[string]*Aggregate, cur Snapshot) map[string]*float64 {
 	if v := ratio(a, "vllm:spec_decode_num_accepted_tokens_total", "vllm:spec_decode_num_drafts_total"); v != nil {
 		put("acceptance_length", 1+*v)
 	}
-	for _, n := range []string{"time_to_first_token_seconds", "inter_token_latency_seconds", "request_time_per_output_token_seconds", "e2e_request_latency_seconds", "request_queue_time_seconds"} {
+	for _, n := range []string{"time_to_first_token_seconds", "inter_token_latency_seconds", "request_time_per_output_token_seconds", "e2e_request_latency_seconds", "request_queue_time_seconds", "request_inference_time_seconds", "request_prefill_time_seconds"} {
 		base := "vllm:" + n
 		out[n] = ratio(a, base+"_sum", base+"_count")
 		out[n+"_p50"] = histogramQuantile(a, base, .5)
 		out[n+"_p95"] = histogramQuantile(a, base, .95)
 	}
+	teiSummaries(out, a, cur)
+	poolingHTTPSummaries(out, a)
 	return out
 }
 

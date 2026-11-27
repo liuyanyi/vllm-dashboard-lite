@@ -1,6 +1,6 @@
 # vLLM Monitor
 
-直连 vLLM `/metrics` 的轻量实验看板。Go + React/TypeScript + Vite + Tailwind/shadcn 风格基础组件 + ECharts + TanStack Query + Zustand + SQLite。
+直连 vLLM / TEI `/metrics` 的轻量推理监控看板，支持 Generation、Embedding、Reranker。Go + React/TypeScript + Vite + Tailwind/shadcn 风格基础组件 + ECharts + TanStack Query + Zustand + SQLite。
 
 ## 运行
 
@@ -21,12 +21,34 @@ chmod +x vllm-monitor
 
 Docker：`docker compose up -d --build`。在 Docker 中，`localhost` 指容器本身，访问宿主机服务请使用 `host.docker.internal` 或实际服务器 IP。服务必须监听容器可达地址。默认宿主端口仍仅暴露在 127.0.0.1。
 
-## 使用
+## YAML 静态配置（无需自动发现）
+
+复制 `config.example.yaml` 为 `monitor.yaml`，修改每个端点的 URL 和模型信息。以静态模式启动：
+
+```bash
+./vllm-monitor -config monitor.yaml -db monitor.db
+# Docker
+docker compose -f compose.yaml -f compose.static.yaml up -d --build
+```
+
+也可设置环境变量 `VLLM_DASHBOARD_CONFIG` 指向 YAML 文件（Web、桌面版均支持，建议使用绝对路径）。修改 YAML 后重启采集器生效。
+
+- 每个端点需要唯一且稳定的 `id`、`backend`（vllm / tei）、`task`（generation / embedding / reranker）、`model` 和 `url`；`name` 为可选显示名称。
+- `metrics_path` 默认 /metrics，`interval` 以毫秒为单位（默认 1000），`record` 控制历史记录；可选 `token` 用于 Bearer 鉴权。保护包含 Token 的 YAML 文件。
+- 指标端口与推理端口不同（例如 TEI --prometheus-port）时，直接填写可达的指标服务 URL。
+- 静态模式只使用 YAML 声明的端点，不加载数据库保存的端点，不扫描端口，不访问 /v1/models 或 /info，也不根据 model_name 标签修改模型身份。添加、修改、删除及扫描 API 会返回 403；UI 相应控件禁用/隐藏。SQLite 仍用于历史数据，手动观测会话保留。
+- ID 是历史记录的稳定关联键；更换模型、后端或任务类型时使用新 ID。YAML 按启动时读取，不热加载。进程启动时间和会话切分仍以实际指标为准，未提供的指标显示缺失。
+- 静态模式按 `backend` + `task` 选择页面。TEI 分别显示 API 请求、文本/文档对、截断后的输入 Token、等待队列、请求延迟、每输入阶段耗时和每次调度轮询（含空轮询）平均批大小/Token 数；不计算不可靠的失败比例。vLLM 非生成式页面区分 HTTP API 请求与引擎完成项，指标缺失时不填零。
+- 不新增 Prometheus 服务，不从 Gateway 推断后端指标；直接抓取每个后端的 metrics。未集成 NVML，GPU 物理利用率和每进程显存不属于本次变更。
+
+TEI 指标口径参考 [官方 Metrics 文档](https://huggingface.co/docs/text-embeddings-inference/main/en/metrics)，vLLM 指标参考 [官方 Metrics 文档](https://docs.vllm.ai/en/latest/usage/metrics/)。
+
+## 使用（未提供 YAML 时）
 
 - 点击侧栏加号添加 `http://GPU服务器:8000`，可配置 Bearer Token 和 metrics 路径。
 - 扫描指定主机的端口范围，发现后点击添加。扫描仅请求 metrics，不发送推理请求。
-- 单层服务列表，模型自动识别；每个端点独立维护观测会话。缺少启动时间也可以记录历史。
-- 首次连接、恢复连接、身份线索变化和每 30 秒查询 `/v1/models`；比较模型 ID/root，忽略 created、权限和列表顺序。查询失败保留已有信息。
+- 单层服务列表，vLLM 默认自动识别；可手动指定后端、任务和模型名称（TEI 模型名称必填）；每个端点独立维护观测会话。缺少启动时间也可以记录历史。
+- 未显式指定模型名称的 vLLM 端点在首次连接、恢复连接、身份线索变化和每 30 秒查询 `/v1/models`；比较模型 ID/root，忽略 created、权限和列表顺序。查询失败保留已有信息。
 - 1 秒默认采样，10 秒吞吐窗口，60 秒延迟窗口，内存保留 30 分钟。首次需要两个有效样本才能显示速率。
 - 打开“记录”保存 30 秒聚合窗口，默认保留 7 天；关闭记录会刷新当前有效窗口。不保存开启记录之前的内存数据。
 - 会话选择器查看历史，原始指标查看全部已解析 Gauge/Counter/Histogram 序列。

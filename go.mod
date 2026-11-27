@@ -3,6 +3,7 @@ module vllm-monitor
 go 1.24.0
 
 require (
+	gopkg.in/yaml.v3 v3.0.1
 	github.com/prometheus/client_model v0.6.1
 	github.com/prometheus/common v0.62.0
 	modernc.org/sqlite v1.36.3

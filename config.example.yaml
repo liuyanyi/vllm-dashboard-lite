@@ -1,0 +1,28 @@
+# Copy to monitor.yaml and replace service URLs / model IDs.
+# IDs are stable history keys. Use a new ID when replacing a model/backend.
+endpoints:
+  - id: qwen-embed
+    name: Qwen3 Embedding
+    backend: tei
+    task: embedding
+    model: Qwen/Qwen3-Embedding-0.6B
+    url: http://host.docker.internal:8001
+    metrics_path: /metrics
+    interval: 2000
+    record: true
+  - id: bge-rerank
+    name: BGE Reranker
+    backend: tei
+    task: reranker
+    model: BAAI/bge-reranker-v2-m3
+    url: http://host.docker.internal:8002
+    interval: 2000
+    record: true
+  - id: qwen-rerank
+    name: Qwen3 Reranker
+    backend: vllm
+    task: reranker
+    model: Qwen/Qwen3-Reranker-0.6B
+    url: http://host.docker.internal:8003
+    interval: 2000
+    record: true

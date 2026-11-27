@@ -30,13 +30,16 @@ import (
 var web embed.FS
 
 type Config struct {
-	ID          string `json:"id"`
-	URL         string `json:"url"`
-	Name        string `json:"name"`
-	Token       string `json:"token,omitempty"`
-	Record      bool   `json:"record"`
-	Interval    int    `json:"interval"`
-	MetricsPath string `json:"metrics_path"`
+	ID          string `json:"id" yaml:"id"`
+	URL         string `json:"url" yaml:"url"`
+	Name        string `json:"name" yaml:"name"`
+	Token       string `json:"token,omitempty" yaml:"token"`
+	Record      bool   `json:"record" yaml:"record"`
+	Interval    int    `json:"interval" yaml:"interval"`
+	MetricsPath string `json:"metrics_path" yaml:"metrics_path"`
+	Backend     string `json:"backend" yaml:"backend"`
+	Task        string `json:"task" yaml:"task"`
+	Model       string `json:"model,omitempty" yaml:"model"`
 }
 type Point struct {
 	At     int64               `json:"at"`
@@ -78,13 +81,27 @@ type App struct {
 	db      *sql.DB
 	client  *http.Client
 	ctx     context.Context
+	staticConfig bool
 }
 
 func main() {
 	addr := flag.String("listen", "127.0.0.1:9090", "listen address")
 	path := flag.String("db", "monitor.db", "SQLite file")
 	desktopChild := flag.Bool("desktop-child", false, "stop when desktop stdin closes")
+	configPath := flag.String("config", os.Getenv("VLLM_DASHBOARD_CONFIG"), "YAML file (read-only static endpoint mode)")
 	flag.Parse()
+	var configs []Config
+	if *configPath != "" {
+		file, err := os.Open(*configPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		configs, err = loadStaticConfig(file)
+		file.Close()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	db, e := openDB(*path)
 	if e != nil {
 		log.Fatal(e)
@@ -103,25 +120,26 @@ func main() {
 			cancel()
 		}()
 	}
-	a := &App{workers: map[string]*Worker{}, db: db, ctx: ctx, client: &http.Client{Timeout: 4 * time.Second}}
-	rows, e := db.Query("SELECT config FROM endpoints")
-	if e != nil {
-		log.Fatal(e)
-	}
-	var configs []Config
-	for rows.Next() {
-		var raw string
-		rows.Scan(&raw)
-		var c Config
-		if json.Unmarshal([]byte(raw), &c) == nil {
-			configs = append(configs, c)
+	a := &App{workers: map[string]*Worker{}, db: db, ctx: ctx, client: &http.Client{Timeout: 4 * time.Second}, staticConfig: *configPath != ""}
+	if !a.staticConfig {
+		rows, err := db.Query("SELECT config FROM endpoints")
+		if err != nil {
+			log.Fatal(err)
 		}
+		for rows.Next() {
+			var raw string
+			var c Config
+			if rows.Scan(&raw) == nil && json.Unmarshal([]byte(raw), &c) == nil && valid(&c) == nil {
+				configs = append(configs, c)
+			}
+		}
+		rows.Close()
 	}
-	rows.Close()
 	for _, c := range configs {
 		a.start(c)
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/settings", a.settings)
 	mux.HandleFunc("GET /api/endpoints", a.list)
 	mux.HandleFunc("POST /api/endpoints", a.add)
 	mux.HandleFunc("PATCH /api/endpoints/{id}", a.update)
@@ -181,6 +199,25 @@ func readBody(w http.ResponseWriter, r *http.Request, v any) error {
 	return json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(v)
 }
 func valid(c *Config) error {
+	c.Model = strings.TrimSpace(c.Model)
+	if c.Backend == "" {
+		c.Backend = "vllm"
+	}
+	if c.Task == "" {
+		c.Task = "generation"
+		if c.Backend == "tei" {
+			c.Task = "embedding"
+		}
+	}
+	if c.Backend != "vllm" && c.Backend != "tei" {
+		return fmt.Errorf("backend must be vllm or tei")
+	}
+	if c.Task != "generation" && c.Task != "embedding" && c.Task != "reranker" {
+		return fmt.Errorf("task must be generation, embedding or reranker")
+	}
+	if c.Backend == "tei" && (c.Task == "generation" || c.Model == "") {
+		return fmt.Errorf("TEI requires a configured model and embedding or reranker task")
+	}
 	u, e := url.Parse(c.URL)
 	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("请输入有效 http(s) 服务地址")
@@ -202,7 +239,7 @@ func valid(c *Config) error {
 }
 func (a *App) start(c Config) {
 	ctx, cancel := context.WithCancel(a.ctx)
-	w := &Worker{cfg: c, cancel: cancel, agg: map[string]*Aggregate{}, state: State{Status: "connecting", Points: []Point{}}}
+	w := &Worker{cfg: c, cancel: cancel, agg: map[string]*Aggregate{}, state: State{Status: "connecting", Model: c.Model, Points: []Point{}}}
 	a.workers[c.ID] = w
 	go func() {
 		for {
@@ -255,8 +292,13 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 	w.mu.Unlock()
 	s, e := a.snapshot(ctx, c)
 	var model, fingerprint, metadata string
+	// A configured model is authoritative. Never query discovery endpoints
+	// or use model_name labels to change the identity of a static worker.
+	if c.Model != "" || a.staticConfig {
+		model, s.Model = c.Model, c.Model
+	}
 	probe = probe || (s.Start != "" && s.Start != previousStart) || (s.Model != "" && s.Model != previousModel)
-	if e == nil && probe {
+	if e == nil && probe && !a.staticConfig && c.Model == "" && c.Backend != "tei" {
 		model, fingerprint, metadata = a.modelInfo(ctx, c, s.Model)
 		// Use a fresh metrics sample after metadata, avoiding an old-process sample
 		// being attributed to a newly reported model.
@@ -444,8 +486,21 @@ func (a *App) states(full bool) []State {
 	})
 	return out
 }
+func (a *App) settings(w http.ResponseWriter, r *http.Request) {
+	jsonOut(w, map[string]bool{"static_config": a.staticConfig})
+}
+func (a *App) writable(w http.ResponseWriter) bool {
+	if a.staticConfig {
+		http.Error(w, "endpoints are managed by YAML configuration", http.StatusForbidden)
+		return false
+	}
+	return true
+}
 func (a *App) list(w http.ResponseWriter, r *http.Request) { jsonOut(w, a.states(true)) }
 func (a *App) add(w http.ResponseWriter, r *http.Request) {
+	if !a.writable(w) {
+		return
+	}
 	var c Config
 	if e := readBody(w, r, &c); e != nil {
 		fail(w, e)
@@ -478,6 +533,9 @@ func (a *App) add(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, c)
 }
 func (a *App) update(w http.ResponseWriter, r *http.Request) {
+	if !a.writable(w) {
+		return
+	}
 	var p struct {
 		Record   *bool `json:"record"`
 		Interval *int  `json:"interval"`
@@ -521,6 +579,9 @@ func (a *App) update(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, map[string]bool{"ok": true})
 }
 func (a *App) remove(w http.ResponseWriter, r *http.Request) {
+	if !a.writable(w) {
+		return
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	id := r.PathValue("id")
@@ -601,6 +662,9 @@ func (a *App) history(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, out)
 }
 func (a *App) scan(w http.ResponseWriter, r *http.Request) {
+	if !a.writable(w) {
+		return
+	}
 	var p struct {
 		Host  string `json:"host"`
 		Ports string `json:"ports"`

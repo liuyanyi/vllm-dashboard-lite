@@ -1,0 +1,6 @@
+# Use together with compose.yaml.
+services:
+  monitor:
+    volumes:
+      - ./monitor.yaml:/etc/monitor/config.yaml:ro
+    command: ["-listen", "0.0.0.0:9090", "-db", "/data/monitor.db", "-config", "/etc/monitor/config.yaml"]
