@@ -1,5 +1,5 @@
 # Copy to monitor.yaml and replace service URLs / model IDs.
-# IDs are stable history keys. Use a new ID when replacing a model/backend.
+# IDs are stable history keys; model names may repeat. Use a new ID for a different backend/task or an unrelated service.
 endpoints:
   - id: qwen-embed
     name: Qwen3 Embedding

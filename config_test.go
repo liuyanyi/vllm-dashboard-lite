@@ -61,18 +61,20 @@ func TestStaticCollectionNoDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	a := &App{db: db, client: server.Client(), staticConfig: true}
+	a := &App{db: db, client: server.Client()}
 	w := &Worker{cfg: Config{ID: "static", URL: server.URL, MetricsPath: "/metrics", Interval: 1000, Backend: "vllm", Task: "reranker", Model: "configured"}, agg: map[string]*Aggregate{}}
 	a.collect(context.Background(), w)
 	a.collect(context.Background(), w)
 	if discovery != 0 || w.state.Model != "configured" || w.state.Run == 0 || w.state.Status != "online" {
 		t.Fatal(discovery, w.state)
 	}
-	for _, handler := range []http.HandlerFunc{a.add, a.update, a.remove, a.scan} {
-		rec := httptest.NewRecorder()
-		handler(rec, httptest.NewRequest("POST", "/", nil))
-		if rec.Code != http.StatusForbidden {
-			t.Fatal(rec.Code)
-		}
+
+}
+
+func TestDuplicateModelNamesAllowed(t *testing.T) {
+	input := staticYAML + strings.ReplaceAll(strings.ReplaceAll(strings.TrimPrefix(staticYAML, "endpoints:\n"), "embed-a", "embed-b"), ":8001", ":8002")
+	cs, err := loadStaticConfig(strings.NewReader(input))
+	if err != nil || len(cs) != 2 || cs[0].Model != cs[1].Model || cs[0].ID == cs[1].ID {
+		t.Fatal(cs, err)
 	}
 }

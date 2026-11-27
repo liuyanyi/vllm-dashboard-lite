@@ -22,7 +22,6 @@ type Snapshot struct {
 	At          time.Time
 	StartStatus string
 	Start       string
-	Model       string
 	Values      map[string]Series
 }
 
@@ -41,9 +40,6 @@ func parseMetrics(r io.Reader) (Snapshot, error) {
 			labels := map[string]string{}
 			for _, l := range m.Label {
 				labels[l.GetName()] = l.GetValue()
-			}
-			if labels["model_name"] != "" {
-				s.Model = labels["model_name"]
 			}
 			add := func(n, k string, v float64, ls map[string]string) {
 				if math.IsNaN(v) || math.IsInf(v, 0) {

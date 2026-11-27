@@ -61,27 +61,23 @@ func TestSessionMigration(t *testing.T) {
 }
 
 func TestObservationSessions(t *testing.T) {
-	model, root, start := "modelA", "/weights/a", ""
-	offline, metadataFail := false, false
-	count, modelCalls := 100, 0
+	label, start := "backend-label-a", ""
+	offline := false
+	count, metadataCalls := 100, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if offline {
-			http.Error(w, "offline", 503)
+		if r.URL.Path != "/metrics" {
+			metadataCalls++
+			http.Error(w, "unexpected discovery", 500)
 			return
 		}
-		if r.URL.Path == "/v1/models" {
-			modelCalls++
-			if metadataFail {
-				http.Error(w, "error", 500)
-				return
-			}
-			fmt.Fprintf(w, `{"data":[{"id":%q,"root":%q,"created":%d}]}`, model, root, time.Now().UnixNano())
+		if offline {
+			http.Error(w, "offline", 503)
 			return
 		}
 		if start != "" {
 			fmt.Fprintf(w, "process_start_time_seconds %s\n", start)
 		}
-		fmt.Fprintf(w, "# TYPE vllm:prompt_tokens_total counter\nvllm:prompt_tokens_total{model_name=%q} %d\n", model, count)
+		fmt.Fprintf(w, "# TYPE vllm:prompt_tokens_total counter\nvllm:prompt_tokens_total{model_name=%q} %d\n", label, count)
 	}))
 	defer server.Close()
 	db, err := openDB(filepath.Join(t.TempDir(), "test.db"))
@@ -90,7 +86,7 @@ func TestObservationSessions(t *testing.T) {
 	}
 	defer db.Close()
 	a := &App{db: db, client: server.Client(), workers: map[string]*Worker{}}
-	w := &Worker{cfg: Config{ID: "e", URL: server.URL, MetricsPath: "/metrics", Interval: 1000, Record: true}, agg: map[string]*Aggregate{}}
+	w := &Worker{cfg: Config{ID: "e", URL: server.URL, MetricsPath: "/metrics", Interval: 1000, Record: true, Model: "configured"}, agg: map[string]*Aggregate{}}
 	collect := func() {
 		t.Helper()
 		a.collect(context.Background(), w)
@@ -100,44 +96,21 @@ func TestObservationSessions(t *testing.T) {
 	}
 	collect()
 	first := w.state.Run
-	if first == 0 || w.state.Start != "" || w.state.Model != "modelA" || w.state.Status != "online" {
+	if first == 0 || w.state.Start != "" || w.state.Model != "configured" || w.state.Status != "online" {
 		t.Fatal(w.state)
 	}
 	count += 10
 	collect()
-	if w.state.Run != first || modelCalls != 1 {
-		t.Fatal(w.state.Run, modelCalls)
-	}
-	// A root-only switch is discovered by the periodic metadata probe.
-	w.retry = time.Time{}
-	root = "/weights/b"
+	label = "backend-label-b"
 	collect()
-	if w.state.Run == first || w.state.Reason != "model_changed" {
-		t.Fatal(w.state)
+	if w.state.Run != first || w.state.Model != "configured" || metadataCalls != 0 {
+		t.Fatal(w.state, metadataCalls)
 	}
-	var history int
-	db.QueryRow("SELECT count(*) FROM rollups WHERE run_id=?", first).Scan(&history)
-	if history == 0 {
-		t.Fatal("missing history without process start")
-	}
-	second := w.state.Run
-	w.retry = time.Time{}
-	collect() // created changes are ignored
-	if w.state.Run != second {
-		t.Fatal("volatile metadata split")
-	}
-	w.retry = time.Time{}
-	metadataFail = true
-	collect()
-	if w.state.Run != second || w.state.Model != "modelA" {
-		t.Fatal("metadata failure lost identity")
-	}
-	metadataFail = false
 	offline = true
 	collect()
 	offline = false
 	collect()
-	if w.state.Run != second {
+	if w.state.Run != first {
 		t.Fatal("brief gap split")
 	}
 	offline = true
@@ -145,37 +118,36 @@ func TestObservationSessions(t *testing.T) {
 	w.offlineSince = time.Now().Add(-31 * time.Second)
 	offline = false
 	collect()
-	if w.state.Run == second || w.state.Reason != "reconnected" {
+	if w.state.Run == first || w.state.Reason != "reconnected" {
 		t.Fatal(w.state)
 	}
-	third := w.state.Run
+	var history int
+	db.QueryRow("SELECT count(*) FROM rollups WHERE run_id=?", first).Scan(&history)
+	if history == 0 {
+		t.Fatal("missing recorded history")
+	}
+	second := w.state.Run
 	count = 1
 	collect()
-	if w.state.Run != third {
+	if w.state.Run != second {
 		t.Fatal("counter reset split")
 	}
 	start = "123"
 	collect()
-	if w.state.Run != third {
+	if w.state.Run != second {
 		t.Fatal("newly available timestamp split")
 	}
 	start = "124"
 	collect()
-	if w.state.Run == third || w.state.Reason != "process_changed" {
+	if w.state.Run == second || w.state.Reason != "process_changed" {
 		t.Fatal(w.state)
 	}
-	fourth := w.state.Run
+	third := w.state.Run
 	start = ""
 	collect()
-	if w.state.Run != fourth {
+	if w.state.Run != third {
 		t.Fatal("missing timestamp split")
 	}
-	model = "modelB"
-	collect()
-	if w.state.Run == fourth || w.state.Model != "modelB" {
-		t.Fatal(w.state)
-	}
-	fifth := w.state.Run
 	a.workers["e"] = w
 	req := httptest.NewRequest("POST", "/api/endpoints/e/sessions", strings.NewReader("{}"))
 	req.SetPathValue("id", "e")
@@ -185,33 +157,24 @@ func TestObservationSessions(t *testing.T) {
 		t.Fatal(response.Code)
 	}
 	collect()
-	if w.state.Run == fifth || w.state.Reason != "manual" {
+	if w.state.Run == third || w.state.Reason != "manual" {
 		t.Fatal(w.state)
 	}
 	var oldModel string
 	db.QueryRow("SELECT model FROM runs WHERE id=?", first).Scan(&oldModel)
-	if oldModel != "modelA" {
-		t.Fatal(oldModel)
+	if oldModel != "configured" || metadataCalls != 0 {
+		t.Fatal(oldModel, metadataCalls)
 	}
-}
-
-func TestModelOrderIgnored(t *testing.T) {
-	reverse := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if reverse {
-			fmt.Fprint(w, `{"data":[{"id":"b","root":"/b"},{"id":"a","root":"/a"}]}`)
-		} else {
-			fmt.Fprint(w, `{"data":[{"id":"a","root":"/a"},{"id":"b","root":"/b"}]}`)
-		}
-	}))
-	defer server.Close()
-	a := &App{client: server.Client()}
-	c := Config{URL: server.URL}
-	_, one, _ := a.modelInfo(context.Background(), c, "")
-	reverse = true
-	_, two, _ := a.modelInfo(context.Background(), c, "")
-	if one != two {
-		t.Fatal(one, two)
+	renamed := w.cfg
+	renamed.Model = "configured-new"
+	w2 := &Worker{cfg: renamed, agg: map[string]*Aggregate{}}
+	a.collect(context.Background(), w2)
+	if w2.state.Run == w.state.Run || w2.state.Model != "configured-new" {
+		t.Fatal(w2.state)
+	}
+	db.QueryRow("SELECT model FROM runs WHERE id=?", first).Scan(&oldModel)
+	if oldModel != "configured" {
+		t.Fatal(oldModel)
 	}
 }
 

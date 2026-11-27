@@ -11,7 +11,7 @@ import (
 
 var endpointID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 
-// Static configurations are the sole source of endpoints when -config is set.
+// YAML is the sole source of endpoints.
 // The database remains available for observation sessions and rollups only.
 func loadStaticConfig(r io.Reader) ([]Config, error) {
 	var file struct {
