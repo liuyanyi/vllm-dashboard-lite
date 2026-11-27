@@ -183,7 +183,7 @@ func (a *App) fetchMetadata(ctx context.Context, c Config, metrics Metadata) (Me
 			var version struct { Version string `json:"version"` }
 			if a.getMetadataJSON(ctx, c, "/version", &version) && version.Version != "" {
 				out.Fields["version"] = version.Version
-				return out, ok || backend == ""
+				return out, ok
 			}
 		}
 		return out, ok

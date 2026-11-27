@@ -35,7 +35,7 @@ endpoints:
     record: true
 ```
 
-- 每个端点需要唯一且稳定的 `id`、`backend`（vllm / tei）、`task`（generation / embedding / reranker）、`model` 和 `url`；`name` 是可选显示名称。模型名与显示名可以重复。端点 URL + metrics_path 不得重复，避免同一地址重复采集。
+- 每个端点仅需唯一且稳定的 `id` 和 `url`；`backend`（vllm / tei）、`task`（generation / embedding / reranker）、`model` 可选，显式配置优先；`name` 是可选显示名称。模型名与显示名可以重复。端点 URL + metrics_path 不得重复，避免同一地址重复采集。
 - `metrics_path` 默认 /metrics；`interval` 为毫秒（默认 1000，允许 500–10000）；`record` 决定是否记录历史（默认 false）；可选 `token` 用于 Bearer 鉴权。请保护含 Token 的 YAML。
 - Docker 默认以只读方式挂载 monitor.yaml，宿主服务可使用 host.docker.internal 或服务器 IP；localhost 指容器自身。指标端口不同（例如 TEI --prometheus-port）时直接填写指标 URL。默认只在宿主回环端口提供 UI。
 - 程序没有多用户登录，仅用于可信本地或实验内网。不要公开到互联网。
@@ -44,11 +44,11 @@ endpoints:
 
 首页总览按 Generation 与 Embedding / Reranker 分组展示实例、状态、吞吐、队列与 P95，可点击进入原有详细视图。侧栏按 YAML 顺序显示，ID 区分同名实例。总览吞吐汇总标记有数据的实例数量，不平均各实例 P95，不混合不同单位的请求/样本数。未连接、离线、缺失或陈旧数据显示缺失。
 
-- YAML 是唯一配置来源。已删除端口扫描、模型发现、/v1/models 元数据查询、模型 fingerprint、Web 增删修改端点 API 与 UI。原始指标标签仍保留用于统计，不用来确定实例身份。
+- YAML 是唯一配置来源。已删除端口扫描、动态端点发现、模型 fingerprint、Web 增删修改端点 API 与 UI。仅对 YAML 指定端点读取元数据：TEI /info，vLLM /v1/models 和 /version，以及 metrics 标签。首次成功采集、重连、进程变化及约每 60 秒刷新；单次探测总超时 2 秒。元数据不参与实例身份和会话切分。独立指标端口可通过 metadata_url 指定 API 地址。未知字段不猜测；vLLM task 无可靠线索时建议显式填写。多个模型名不随机选择。
 - ID 关联历史记录；修改显示名/模型名无需避让，重启监控程序会按新配置创建新观测会话，旧会话的模型名不变。若更换 backend/task 或将 ID 用于无关服务，请使用新 ID，避免旧指标混用。
 - 1 秒默认采样，10 秒吞吐窗口，60 秒延迟窗口，内存保留 30 分钟。首次需要两个有效样本才能显示速率。
 - record: true 保存约 30 秒聚合窗口，默认保留 7 天。会话选择器与原始指标继续可用。
-- 首次观测、有效进程启动时间变化、连续离线至少 30 秒后恢复、手动新会话时切分。短暂离线保留缺口；Counter 回退只重置速率。上游实际换模型但不修改 YAML 不会自动发现，须由使用者维护配置。
+- 首次观测、有效进程启动时间变化、连续离线至少 30 秒后恢复、手动新会话时切分。短暂离线保留缺口；Counter 回退只重置速率。上游模型名变化会刷新显示（未显式覆盖时），但不会仅因名称变化切分会话，历史会话保留初始名称。
 - TEI 展示 API 请求、文本/文档对、输入 Token、等待队列、请求延迟、阶段耗时和每次调度轮询平均批大小/Token 数；vLLM 非生成式页面区分 HTTP API 请求与引擎完成项。未提供指标不填零。
 - SQLite 仅用于观测会话和历史，旧库的 endpoints 表不会加载、修改或删除。已有历史如需沿用，可手动在 YAML 中使用原 ID（旧表存在时可用 `SELECT id,json_extract(config,'$.url') FROM endpoints;` 查阅）。无需自动迁移配置。
 - 不增加 Prometheus 服务，不集成 NVML；直接抓取后端 metrics。
@@ -85,7 +85,7 @@ python3 scripts/mock_vllm.py
 python3 scripts/integration.py
 ```
 
-模拟器仅用于验证。更新后的集成测试检查 YAML-only 启动、实时速率、进程变化切分、历史保留、无元数据查询及已移除的动态配置接口；新增总览逻辑和同名模型配置测试。
+模拟器仅用于验证。更新后的集成测试检查 YAML-only 启动、实时速率、进程变化切分、历史保留、元数据查询及已移除的动态配置接口；新增总览逻辑和同名模型配置测试。
 
 ## 当前实现边界
 
@@ -161,7 +161,7 @@ Dashboard 支持 Gauge 及省略 TYPE 的数值字段，并区分未暴露、无
 - 会话信息分别显示“观测开始”和“进程启动”；不使用 `/v1/models.created` 推断启动时间。
 - 监控程序重新启动后，首次成功采样创建新会话，旧历史保留。新会话使用独立数据库 ID，因此相同端口、相同模型、相同启动时间也能手动分开记录。
 - 旧数据库自动迁移，保留原 run ID 与关联聚合数据；数据库升级后不建议用旧版程序继续写入。
-- 旧版的模型/root 自动发现机制已移除。模型配置变更后重启，创建新会话。
+- 模型/root 元数据仅用于展示，不触发切分；监控程序重启时创建新会话。
 - 上游没有启动标识时，短时间重启可能无法检测。需要严格实验边界时点击“新会话”。
 - 历史接口继续使用 `/api/runs` 和 `/api/history?run=...`；新会话接口为 `POST /api/endpoints/{id}/sessions`，返回 202 表示已排队。
 
