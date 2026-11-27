@@ -5,6 +5,14 @@ services:
       - "127.0.0.1:9090:9090"
     volumes:
       - monitor-data:/data
+      - type: bind
+        source: ./monitor.yaml
+        target: /etc/monitor/monitor.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      VLLM_DASHBOARD_CONFIG: /etc/monitor/monitor.yaml
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

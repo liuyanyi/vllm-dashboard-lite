@@ -3,10 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"database/sql"
 	"embed"
-	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,7 +17,6 @@ import (
 	"os"
 	"os/signal"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -30,13 +27,17 @@ import (
 var web embed.FS
 
 type Config struct {
-	ID          string `json:"id"`
-	URL         string `json:"url"`
-	Name        string `json:"name"`
-	Token       string `json:"token,omitempty"`
-	Record      bool   `json:"record"`
-	Interval    int    `json:"interval"`
-	MetricsPath string `json:"metrics_path"`
+	ID          string `json:"id" yaml:"id"`
+	URL         string `json:"url" yaml:"url"`
+	Name        string `json:"name" yaml:"name"`
+	Token       string `json:"token,omitempty" yaml:"token"`
+	Record      bool   `json:"record" yaml:"record"`
+	Interval    int    `json:"interval" yaml:"interval"`
+	MetricsPath string `json:"metrics_path" yaml:"metrics_path"`
+	MetadataURL string `json:"metadata_url,omitempty" yaml:"metadata_url"`
+	Backend     string `json:"backend" yaml:"backend"`
+	Task        string `json:"task" yaml:"task"`
+	Model       string `json:"model,omitempty" yaml:"model"`
 }
 type Point struct {
 	At     int64               `json:"at"`
@@ -52,6 +53,7 @@ type State struct {
 	FirstSeen   string   `json:"first_seen"`
 	Reason      string   `json:"reason"`
 	Model       string   `json:"model"`
+	Metadata    Metadata `json:"metadata"`
 	Latest      Point    `json:"latest"`
 	Points      []Point  `json:"points"`
 	Raw         []Series `json:"raw,omitempty"`
@@ -64,17 +66,17 @@ type Worker struct {
 	recent       []Snapshot
 	agg          map[string]*Aggregate
 	window       time.Time
-	fingerprint  string
-	metricModel  string
 	offlineSince time.Time
 	touched      time.Time
 	manual       bool
-	retry        time.Time
-	cancel       context.CancelFunc
+	remote       Metadata
+	nextMetadata time.Time
+	runModel     string
 }
 type App struct {
 	mu      sync.Mutex
 	workers map[string]*Worker
+	order   []string
 	db      *sql.DB
 	client  *http.Client
 	ctx     context.Context
@@ -84,7 +86,21 @@ func main() {
 	addr := flag.String("listen", "127.0.0.1:9090", "listen address")
 	path := flag.String("db", "monitor.db", "SQLite file")
 	desktopChild := flag.Bool("desktop-child", false, "stop when desktop stdin closes")
+	defaultConfig := os.Getenv("VLLM_DASHBOARD_CONFIG")
+	if defaultConfig == "" {
+		defaultConfig = "monitor.yaml"
+	}
+	configPath := flag.String("config", defaultConfig, "YAML endpoint configuration (required)")
 	flag.Parse()
+	file, err := os.Open(*configPath)
+	if err != nil {
+		log.Fatalf("open YAML config %q: %v (copy config.example.yaml to monitor.yaml)", *configPath, err)
+	}
+	configs, err := loadStaticConfig(file)
+	file.Close()
+	if err != nil {
+		log.Fatal(err)
+	}
 	db, e := openDB(*path)
 	if e != nil {
 		log.Fatal(e)
@@ -104,33 +120,16 @@ func main() {
 		}()
 	}
 	a := &App{workers: map[string]*Worker{}, db: db, ctx: ctx, client: &http.Client{Timeout: 4 * time.Second}}
-	rows, e := db.Query("SELECT config FROM endpoints")
-	if e != nil {
-		log.Fatal(e)
-	}
-	var configs []Config
-	for rows.Next() {
-		var raw string
-		rows.Scan(&raw)
-		var c Config
-		if json.Unmarshal([]byte(raw), &c) == nil {
-			configs = append(configs, c)
-		}
-	}
-	rows.Close()
 	for _, c := range configs {
 		a.start(c)
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/settings", a.settings)
 	mux.HandleFunc("GET /api/endpoints", a.list)
-	mux.HandleFunc("POST /api/endpoints", a.add)
-	mux.HandleFunc("PATCH /api/endpoints/{id}", a.update)
-	mux.HandleFunc("DELETE /api/endpoints/{id}", a.remove)
 	mux.HandleFunc("POST /api/endpoints/{id}/sessions", a.newSession)
 	mux.HandleFunc("GET /api/events", a.events)
 	mux.HandleFunc("GET /api/runs", a.runs)
 	mux.HandleFunc("GET /api/history", a.history)
-	mux.HandleFunc("POST /api/scan", a.scan)
 	sub, _ := fs.Sub(web, "web/dist")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
 	srv := &http.Server{Addr: *addr, Handler: protect(mux), ReadHeaderTimeout: 5 * time.Second}
@@ -177,15 +176,29 @@ func jsonOut(w http.ResponseWriter, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 func fail(w http.ResponseWriter, e error) { http.Error(w, e.Error(), 400) }
-func readBody(w http.ResponseWriter, r *http.Request, v any) error {
-	return json.NewDecoder(http.MaxBytesReader(w, r.Body, 65536)).Decode(v)
-}
 func valid(c *Config) error {
+	c.Model = strings.TrimSpace(c.Model)
+	if c.Backend != "" && c.Backend != "vllm" && c.Backend != "tei" {
+		return fmt.Errorf("backend must be vllm or tei")
+	}
+	if c.Task != "" && c.Task != "generation" && c.Task != "embedding" && c.Task != "reranker" {
+		return fmt.Errorf("task must be generation, embedding or reranker")
+	}
+	if c.Backend == "tei" && c.Task == "generation" {
+		return fmt.Errorf("TEI does not support generation")
+	}
 	u, e := url.Parse(c.URL)
 	if e != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("请输入有效 http(s) 服务地址")
 	}
 	c.URL = strings.TrimRight(c.URL, "/")
+	if c.MetadataURL != "" {
+		m, err := url.Parse(c.MetadataURL)
+		if err != nil || m.Host == "" || (m.Scheme != "http" && m.Scheme != "https") || m.User != nil || m.RawQuery != "" || m.Fragment != "" {
+			return fmt.Errorf("metadata_url must be a valid http(s) base URL")
+		}
+		c.MetadataURL = strings.TrimRight(c.MetadataURL, "/")
+	}
 	if c.Interval == 0 {
 		c.Interval = 1000
 	}
@@ -201,9 +214,10 @@ func valid(c *Config) error {
 	return nil
 }
 func (a *App) start(c Config) {
-	ctx, cancel := context.WithCancel(a.ctx)
-	w := &Worker{cfg: c, cancel: cancel, agg: map[string]*Aggregate{}, state: State{Status: "connecting", Points: []Point{}}}
+	ctx := a.ctx
+	w := &Worker{cfg: c, agg: map[string]*Aggregate{}, state: State{Status: "connecting", Model: c.Model, Points: []Point{}}}
 	a.workers[c.ID] = w
+	a.order = append(a.order, c.ID)
 	go func() {
 		for {
 			if ctx.Err() != nil {
@@ -250,27 +264,26 @@ func (a *App) snapshot(ctx context.Context, c Config) (Snapshot, error) {
 func (a *App) collect(ctx context.Context, w *Worker) {
 	w.mu.Lock()
 	c := w.cfg
-	probe := w.state.Run == 0 || !w.offlineSince.IsZero() || w.manual || time.Now().After(w.retry)
-	previousStart, previousModel := w.state.Start, w.metricModel
+	remote, next := w.remote, w.nextMetadata
+	previousStart, offline := w.state.Start, w.offlineSince
 	w.mu.Unlock()
 	s, e := a.snapshot(ctx, c)
-	var model, fingerprint, metadata string
-	probe = probe || (s.Start != "" && s.Start != previousStart) || (s.Model != "" && s.Model != previousModel)
-	if e == nil && probe {
-		model, fingerprint, metadata = a.modelInfo(ctx, c, s.Model)
-		// Use a fresh metrics sample after metadata, avoiding an old-process sample
-		// being attributed to a newly reported model.
-		if metadata != "" {
-			check, err := a.snapshot(ctx, c)
-			if err != nil {
-				e = err
-			} else {
-				if check.Start != s.Start || check.Model != s.Model {
-					model, fingerprint, metadata = "", "", ""
-				}
-				s = check
-			}
+	var meta Metadata
+	if e == nil {
+		metrics := metadataFromMetrics(s)
+		restarted := s.Start != "" && previousStart != "" && s.Start != previousStart
+		if restarted || (!offline.IsZero() && s.At.Sub(offline) >= 30*time.Second) {
+			remote, next = Metadata{}, time.Time{}
 		}
+		if next.IsZero() || time.Now().After(next) || !offline.IsZero() {
+			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			if found, ok := a.fetchMetadata(probeCtx, c, metrics); ok {
+				remote = found
+			}
+			cancel()
+			next = time.Now().Add(60*time.Second)
+		}
+		meta = resolveMetadata(c, metrics, remote)
 	}
 	w.mu.Lock()
 	if ctx.Err() != nil {
@@ -298,7 +311,9 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 	w.state.Error = ""
 	w.state.Status = "online"
 	w.state.StartStatus = s.StartStatus
-	reason := sessionReason(w, s, fingerprint)
+	w.remote, w.nextMetadata = remote, next
+	w.state.Metadata = meta
+	reason := sessionReason(w, s)
 	if reason != "" {
 		if !a.flush(w) {
 			w.state.Error = "历史写入失败"
@@ -308,19 +323,16 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 		if w.state.Run > 0 && !w.prev.At.IsZero() {
 			a.db.Exec("UPDATE runs SET last_seen=? WHERE id=?", w.prev.At.UTC().Format(time.RFC3339Nano), w.state.Run)
 		}
-		name := model
-		if name == "" {
-			name = s.Model
-		}
-		rid, err := createSession(a.db, c.ID, s.Start, name, metadata, reason, s.At)
+		metadataJSON, _ := json.Marshal(meta)
+		rid, err := createSession(a.db, c.ID, s.Start, meta.Model, string(metadataJSON), reason, s.At)
 		if err != nil {
 			w.state.Error = "无法保存会话"
 			w.mu.Unlock()
 			return
 		}
-		w.state.Run, w.state.Model, w.state.Start = rid, name, s.Start
+		w.state.Run, w.state.Model, w.state.Start = rid, meta.Model, s.Start
+		w.runModel = meta.Model
 		w.state.FirstSeen, w.state.Reason = s.At.UTC().Format(time.RFC3339Nano), reason
-		w.fingerprint, w.metricModel = fingerprint, s.Model
 		w.prev, w.recent, w.state.Points = Snapshot{}, nil, []Point{}
 		w.manual = false
 		w.touched = s.At
@@ -328,17 +340,19 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 		if s.Start != "" {
 			w.state.Start = s.Start
 		}
-		if s.Model != "" {
-			w.metricModel = s.Model
-			if w.state.Model == "" {
-				w.state.Model = s.Model
+		w.state.Model = meta.Model
+		// Fill a previously unknown session label once, without relabeling
+		// earlier observations or cutting sessions when metadata changes.
+		if w.runModel == "" && meta.Model != "" {
+			metadataJSON, _ := json.Marshal(meta)
+			if _, err := a.db.Exec("UPDATE runs SET model=?,metadata=? WHERE id=? AND model=''", meta.Model, string(metadataJSON), w.state.Run); err == nil {
+				w.runModel = meta.Model
+			} else {
+				w.state.Error = "会话元数据更新失败"
 			}
 		}
-		if metadata != "" {
-			w.state.Model, w.fingerprint = model, fingerprint
-		}
-		if probe || s.At.Sub(w.touched) >= 30*time.Second {
-			if _, err := a.db.Exec("UPDATE runs SET start=?,model=?,metadata=CASE WHEN ?='' THEN metadata ELSE ? END,last_seen=? WHERE id=?", w.state.Start, w.state.Model, metadata, metadata, s.At.UTC().Format(time.RFC3339Nano), w.state.Run); err != nil {
+		if s.At.Sub(w.touched) >= 30*time.Second {
+			if _, err := a.db.Exec("UPDATE runs SET start=?,last_seen=? WHERE id=?", w.state.Start, s.At.UTC().Format(time.RFC3339Nano), w.state.Run); err != nil {
 				w.state.Error = "会话更新失败"
 			} else {
 				w.touched = s.At
@@ -346,11 +360,8 @@ func (a *App) collect(ctx context.Context, w *Worker) {
 		}
 	}
 	w.offlineSince = time.Time{}
-	if probe {
-		w.retry = time.Now().Add(30 * time.Second)
-	}
 	maxGap := float64(c.Interval)/1000*3 + 1
-	if c.Record && w.cfg.Record && w.state.Run > 0 && !w.prev.At.IsZero() {
+	if c.Record && w.state.Run > 0 && !w.prev.At.IsZero() {
 		if len(w.agg) == 0 {
 			w.window = w.prev.At
 		}
@@ -426,6 +437,16 @@ func (a *App) states(full bool) []State {
 		s := w.state
 		s.Config = w.cfg
 		s.Config.Token = ""
+		// Present effective configuration while retaining immutable YAML in Worker.
+		if s.Config.Backend == "" {
+			s.Config.Backend = s.Metadata.Backend
+		}
+		if s.Config.Task == "" {
+			s.Config.Task = s.Metadata.Task
+		}
+		if s.Config.Model == "" {
+			s.Config.Model = s.Model
+		}
 		if full {
 			s.Points = append([]Point{}, s.Points...)
 			s.Raw = append([]Series{}, s.Raw...)
@@ -436,104 +457,23 @@ func (a *App) states(full bool) []State {
 		out = append(out, s)
 		w.mu.Unlock()
 	}
+	order := make(map[string]int, len(a.order))
+	for i, id := range a.order {
+		order[id] = i
+	}
 	sort.Slice(out, func(i, j int) bool {
-		if out[i].Config.URL == out[j].Config.URL {
-			return out[i].Config.ID < out[j].Config.ID
+		left, right := out[i].Config.ID, out[j].Config.ID
+		if order[left] != order[right] {
+			return order[left] < order[right]
 		}
-		return out[i].Config.URL < out[j].Config.URL
+		return left < right
 	})
 	return out
 }
+func (a *App) settings(w http.ResponseWriter, r *http.Request) {
+	jsonOut(w, map[string]bool{"static_config": true})
+}
 func (a *App) list(w http.ResponseWriter, r *http.Request) { jsonOut(w, a.states(true)) }
-func (a *App) add(w http.ResponseWriter, r *http.Request) {
-	var c Config
-	if e := readBody(w, r, &c); e != nil {
-		fail(w, e)
-		return
-	}
-	if e := valid(&c); e != nil {
-		fail(w, e)
-		return
-	}
-	b := make([]byte, 12)
-	rand.Read(b)
-	c.ID = hex.EncodeToString(b)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for _, x := range a.workers {
-		x.mu.Lock()
-		same := x.cfg.URL == c.URL
-		x.mu.Unlock()
-		if same {
-			fail(w, fmt.Errorf("端点已存在"))
-			return
-		}
-	}
-	if e := saveJSON(a.db, c.ID, c); e != nil {
-		fail(w, e)
-		return
-	}
-	a.start(c)
-	c.Token = ""
-	jsonOut(w, c)
-}
-func (a *App) update(w http.ResponseWriter, r *http.Request) {
-	var p struct {
-		Record   *bool `json:"record"`
-		Interval *int  `json:"interval"`
-	}
-	if e := readBody(w, r, &p); e != nil {
-		fail(w, e)
-		return
-	}
-	a.mu.Lock()
-	x := a.workers[r.PathValue("id")]
-	a.mu.Unlock()
-	if x == nil {
-		http.NotFound(w, r)
-		return
-	}
-	x.mu.Lock()
-	defer x.mu.Unlock()
-	c := x.cfg
-	if p.Record != nil {
-		c.Record = *p.Record
-	}
-	if p.Interval != nil {
-		c.Interval = *p.Interval
-	}
-	if e := valid(&c); e != nil {
-		fail(w, e)
-		return
-	}
-	if x.cfg.Record != c.Record {
-		if !a.flush(x) {
-			http.Error(w, "写入失败", 500)
-			return
-		}
-		x.prev = Snapshot{}
-	}
-	if e := saveJSON(a.db, c.ID, c); e != nil {
-		fail(w, e)
-		return
-	}
-	x.cfg = c
-	jsonOut(w, map[string]bool{"ok": true})
-}
-func (a *App) remove(w http.ResponseWriter, r *http.Request) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	id := r.PathValue("id")
-	if x := a.workers[id]; x != nil {
-		x.cancel()
-		x.mu.Lock()
-		a.flush(x)
-		x.mu.Unlock()
-		delete(a.workers, id)
-	}
-	a.db.Exec("DELETE FROM endpoints WHERE id=?", id)
-	jsonOut(w, map[string]bool{"ok": true})
-}
 func (a *App) events(w http.ResponseWriter, r *http.Request) {
 	f, ok := w.(http.Flusher)
 	if !ok {
@@ -561,7 +501,7 @@ func (a *App) events(w http.ResponseWriter, r *http.Request) {
 	}
 }
 func (a *App) runs(w http.ResponseWriter, r *http.Request) {
-	rows, e := a.db.Query("SELECT id,start,model,first_seen,last_seen,reason FROM runs WHERE endpoint_id=? ORDER BY id DESC LIMIT 100", r.URL.Query().Get("endpoint"))
+	rows, e := a.db.Query("SELECT id,start,model,first_seen,last_seen,reason,metadata FROM runs WHERE endpoint_id=? ORDER BY id DESC LIMIT 100", r.URL.Query().Get("endpoint"))
 	if e != nil {
 		fail(w, e)
 		return
@@ -570,9 +510,11 @@ func (a *App) runs(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var id int64
-		var s, m, f, l, reason string
-		rows.Scan(&id, &s, &m, &f, &l, &reason)
-		out = append(out, map[string]any{"id": id, "start": s, "model": m, "first_seen": f, "last_seen": l, "reason": reason})
+		var s, m, f, l, reason, raw string
+		rows.Scan(&id, &s, &m, &f, &l, &reason, &raw)
+		var meta Metadata
+		_ = json.Unmarshal([]byte(raw), &meta)
+		out = append(out, map[string]any{"id": id, "start": s, "model": m, "first_seen": f, "last_seen": l, "reason": reason, "metadata": meta})
 	}
 	jsonOut(w, out)
 }
@@ -598,71 +540,5 @@ func (a *App) history(w http.ResponseWriter, r *http.Request) {
 		t, _ := time.Parse(time.RFC3339Nano, at)
 		out = append(out, Point{t.UnixMilli(), summaries(ag, s)})
 	}
-	jsonOut(w, out)
-}
-func (a *App) scan(w http.ResponseWriter, r *http.Request) {
-	var p struct {
-		Host  string `json:"host"`
-		Ports string `json:"ports"`
-	}
-	if e := readBody(w, r, &p); e != nil {
-		fail(w, e)
-		return
-	}
-	if p.Host == "" || strings.ContainsAny(p.Host, "/ ?#@") {
-		fail(w, fmt.Errorf("主机名无效"))
-		return
-	}
-	ports := map[int]bool{}
-	for _, part := range strings.Split(p.Ports, ",") {
-		bounds := strings.Split(strings.TrimSpace(part), "-")
-		lo, e := strconv.Atoi(bounds[0])
-		hi := lo
-		if len(bounds) == 2 {
-			hi, e = strconv.Atoi(bounds[1])
-		}
-		if e != nil || len(bounds) > 2 || lo < 1 || hi > 65535 || hi < lo || hi-lo > 255 {
-			fail(w, fmt.Errorf("端口范围无效，最多 256 个"))
-			return
-		}
-		for i := lo; i <= hi; i++ {
-			ports[i] = true
-		}
-	}
-	if len(ports) > 256 {
-		fail(w, fmt.Errorf("最多扫描 256 个端口"))
-		return
-	}
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 16)
-	out := []string{}
-	for port := range ports {
-		wg.Add(1)
-		go func(port int) {
-			defer wg.Done()
-			select {
-			case sem <- struct{}{}:
-			case <-r.Context().Done():
-				return
-			}
-			defer func() { <-sem }()
-			ctx, cancel := context.WithTimeout(r.Context(), 1200*time.Millisecond)
-			defer cancel()
-			c := Config{URL: "http://" + net.JoinHostPort(p.Host, strconv.Itoa(port)), MetricsPath: "/metrics"}
-			s, e := a.snapshot(ctx, c)
-			if e == nil {
-				for _, v := range s.Values {
-					if strings.HasPrefix(v.Name, "vllm:") {
-						mu.Lock()
-						out = append(out, c.URL)
-						mu.Unlock()
-						break
-					}
-				}
-			}
-		}(port)
-	}
-	wg.Wait()
 	jsonOut(w, out)
 }

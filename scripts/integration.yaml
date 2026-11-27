@@ -1,0 +1,9 @@
+endpoints:
+  - id: mock-generation
+    backend: vllm
+    task: generation
+    model: configured-model
+    url: http://127.0.0.1:18000
+    metrics_path: /metrics
+    interval: 500
+    record: true

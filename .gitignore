@@ -9,3 +9,5 @@ desktop/bin/
 desktop/release/
 release/
 artifacts/
+
+monitor.yaml

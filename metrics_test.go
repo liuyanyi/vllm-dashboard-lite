@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-func TestParseIdentity(t *testing.T) {
+func TestParseStart(t *testing.T) {
 	s, e := parseMetrics(strings.NewReader("# TYPE process_start_time_seconds gauge\nprocess_start_time_seconds 1.23456789e9\n# TYPE vllm:prompt_tokens_total counter\nvllm:prompt_tokens_total{model_name=\"a\"} 100\n"))
-	if e != nil || s.Start != "1234567890.000000000" || s.Model != "a" {
+	if e != nil || s.Start != "1234567890.000000000" {
 		t.Fatalf("%+v %v", s, e)
 	}
 }
@@ -56,10 +56,10 @@ func TestStartAvailability(t *testing.T) {
 	}
 }
 func TestEndpointOrderStable(t *testing.T) {
-	a := &App{workers: map[string]*Worker{"b": {cfg: Config{ID: "b", URL: "http://gpu:8001"}}, "a": {cfg: Config{ID: "a", URL: "http://gpu:8000"}}}}
+	a := &App{order: []string{"b", "a"}, workers: map[string]*Worker{"b": {cfg: Config{ID: "b", URL: "http://gpu:8001"}}, "a": {cfg: Config{ID: "a", URL: "http://gpu:8000"}}}}
 	for i := 0; i < 100; i++ {
 		s := a.states(false)
-		if s[0].Config.ID != "a" || s[1].Config.ID != "b" {
+		if s[0].Config.ID != "b" || s[1].Config.ID != "a" {
 			t.Fatal(s)
 		}
 	}

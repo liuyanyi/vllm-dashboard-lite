@@ -8,7 +8,12 @@ if(!app.requestSingleInstanceLock()){app.quit()}else{
   const binary=path.join(app.isPackaged?path.join(process.resourcesPath,'backend'):path.join(__dirname,'bin'),process.platform==='win32'?'vllm-monitor.exe':'vllm-monitor');
   const db=process.env.VLLM_DASHBOARD_DB?path.resolve(process.env.VLLM_DASHBOARD_DB):path.join(app.getPath('userData'),'monitor.db');
   fs.mkdirSync(path.dirname(db),{recursive:true});
-  backend=startBackend(binary,db);
+  const config=process.env.VLLM_DASHBOARD_CONFIG?path.resolve(process.env.VLLM_DASHBOARD_CONFIG):path.join(app.getPath('userData'),'monitor.yaml');
+  if(!process.env.VLLM_DASHBOARD_CONFIG&&!fs.existsSync(config)){
+   fs.mkdirSync(path.dirname(config),{recursive:true});
+   fs.writeFileSync(config,'# Configure endpoints here and restart the app. See config.example.yaml.\nendpoints: []\n',{flag:'wx',mode:0o600});
+  }
+  backend=startBackend(binary,db,{config});
   backend.child.on('exit',()=>{if(!quitting){dialog.showErrorBox('服务已停止','本地采集器已退出，请重新启动应用。');app.quit()}});
   const origin=await backend.ready;
   window=new BrowserWindow({width:1440,height:960,minWidth:1000,minHeight:700,title:'vLLM Dashboard Lite',show:false,backgroundColor:'#fafbfc',webPreferences:{nodeIntegration:false,contextIsolation:true,sandbox:true}});
